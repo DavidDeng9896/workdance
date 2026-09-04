@@ -40,7 +40,7 @@ impl Default for VisionWorkerConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VisionEvent {
     TierChanged {
         from: VisionTier,
@@ -48,6 +48,8 @@ pub enum VisionEvent {
     },
     /// Backend selection / degradation for UI banner (emitted once at start).
     BackendStatus(VisionBackendStatus),
+    /// Latest hand observation (presence and optional 21 landmarks). WP-M2.
+    HandFrame(workdance_core::HandFrame),
 }
 
 /// Background capture + detect + dual-tier loop.
@@ -163,6 +165,7 @@ where
         };
         let hand = detector.process_frame(&frame, detail);
         let tier = machine.observe(Instant::now(), hand.as_palm());
+        on_event(VisionEvent::HandFrame(hand));
         if tier != last_tier {
             on_event(VisionEvent::TierChanged {
                 from: last_tier,
@@ -231,6 +234,7 @@ mod tests {
                         assert_eq!(s.backend, "stub");
                         saw_status = true;
                     }
+                    VisionEvent::HandFrame(_) => {}
                     VisionEvent::TierChanged { to, .. } => match to {
                         VisionTier::Active => saw_active = true,
                         VisionTier::Sleep => {

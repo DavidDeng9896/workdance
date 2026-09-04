@@ -60,6 +60,9 @@ pub fn start_vision_worker(app: &AppHandle) -> Result<(), String> {
         VisionEvent::BackendStatus(status) => {
             *handle.state::<AppState>().vision_status.lock() = Some(status);
         }
+        VisionEvent::HandFrame(frame) => {
+            notify_hand_frame(&handle, frame);
+        }
     })
     .map_err(|e| e.to_string())?;
 
@@ -93,6 +96,14 @@ fn notify_input(app: &AppHandle, tier: VisionTier) {
         bridge.apply_policy(cfg.gesture_enabled, cfg.voice_only);
     }
     drop(guard);
+}
+
+fn notify_hand_frame(app: &AppHandle, frame: workdance_core::HandFrame) {
+    let state = app.state::<AppState>();
+    let guard = state.input.lock();
+    if let Some(bridge) = guard.as_ref() {
+        bridge.push_hand_frame(frame);
+    }
 }
 
 fn apply_vision_tier(app: &AppHandle, tier: VisionTier) {

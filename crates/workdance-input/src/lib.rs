@@ -1,10 +1,11 @@
-//! WP2–WP3: gesture classify, focus lock, G07 offline dictation, serial OS inject.
+//! WP2–WP3 / WP-M2: gesture classify, landmark→G02–G05, focus, G07, serial OS inject.
 
 mod asr;
 mod engine;
 mod focus;
 mod g07;
 mod inject;
+mod landmarks;
 mod smoother;
 
 pub use asr::{
@@ -13,6 +14,7 @@ pub use asr::{
 pub use engine::{
     EngineTick, GestureEngine, HandSample, InjectCommand, MemoEvent, G08_WINDOW_MS, SHORT_FIST_MAX,
 };
+pub use landmarks::{hand_frame_to_sample, sample_from_landmarks};
 pub use focus::{
     create_default_focus_probe, FocusLock, FocusProbe, FocusTarget, StubFocusProbe, FOCUS_DWELL_MS,
 };

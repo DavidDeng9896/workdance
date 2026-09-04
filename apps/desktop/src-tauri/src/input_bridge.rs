@@ -1,4 +1,4 @@
-//! Bridges vision tier → gesture engine → inject + G07/G08 + WP5 voice-only listen.
+//! Bridges vision tier / HandFrame → gesture engine → inject + G07/G08 + WP5 voice-only listen.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager};
-use workdance_core::{load_config, now_stamp, write_memo, AppMode, VisionTier};
+use workdance_core::{load_config, now_stamp, write_memo, AppMode, HandFrame, VisionTier};
 use workdance_input::{
-    create_default_asr, create_default_injector, G07Event, GestureEngine, HandSample, InjectCommand,
-    InjectQueue, MemoEvent,
+    create_default_asr, create_default_injector, hand_frame_to_sample, G07Event, GestureEngine,
+    HandSample, InjectCommand, InjectQueue, MemoEvent,
 };
 
 use crate::{tray, AppState};
@@ -18,6 +18,8 @@ use crate::{tray, AppState};
 /// Shared policy + tier for the gesture / voice-listen thread.
 pub struct InputBridge {
     tier: Arc<Mutex<VisionTier>>,
+    /// Latest vision hand frame (landmarks when Active + landmarker).
+    latest_hand: Arc<Mutex<Option<HandFrame>>>,
     /// When true, cursor inject is stripped (voice-only / gestures off).
     cursor_enabled: Arc<AtomicBool>,
     /// Software-armed mic listen (no fist required) for voice-only fallback.
@@ -31,6 +33,7 @@ impl InputBridge {
     pub fn start(app: AppHandle) -> Self {
         let cfg = load_config().unwrap_or_default();
         let tier = Arc::new(Mutex::new(VisionTier::Sleep));
+        let latest_hand = Arc::new(Mutex::new(None));
         let cursor_enabled = Arc::new(AtomicBool::new(
             cfg.gesture_enabled && !cfg.voice_only,
         ));
@@ -46,6 +49,7 @@ impl InputBridge {
                 .unwrap_or(false);
 
         let tier_feed = tier.clone();
+        let hand_feed = latest_hand.clone();
         let cursor_feed = cursor_enabled.clone();
         let listen_feed = voice_listen.clone();
         let stop_flag = stop.clone();
@@ -58,6 +62,7 @@ impl InputBridge {
                     cfg.dead_zone,
                     force_stub,
                     tier_feed,
+                    hand_feed,
                     cursor_feed,
                     listen_feed,
                     stop_flag,
@@ -68,6 +73,7 @@ impl InputBridge {
 
         Self {
             tier,
+            latest_hand,
             cursor_enabled,
             voice_listen,
             stop,
@@ -82,6 +88,11 @@ impl InputBridge {
 
     pub fn current_tier(&self) -> VisionTier {
         *self.tier.lock()
+    }
+
+    /// WP-M2: push latest vision observation (may include 21 landmarks).
+    pub fn push_hand_frame(&self, frame: HandFrame) {
+        *self.latest_hand.lock() = Some(frame);
     }
 
     /// Apply gesture_enabled / voice_only from settings.
@@ -126,6 +137,7 @@ fn gesture_loop(
     dead_zone: f32,
     force_stub: bool,
     tier: Arc<Mutex<VisionTier>>,
+    latest_hand: Arc<Mutex<Option<HandFrame>>>,
     cursor_enabled: Arc<AtomicBool>,
     voice_listen: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -138,7 +150,7 @@ fn gesture_loop(
     let mut last_cursor = true;
     let mut listen_was_on = false;
     eprintln!(
-        "[workdance-input] gesture loop stub_samples={} (WP3–WP5)",
+        "[workdance-input] gesture loop stub_samples={} landmark_path=wp-m2",
         force_stub
     );
 
@@ -174,9 +186,15 @@ fn gesture_loop(
         }
 
         // Gesture path only when cursor enabled and Active (开局无误触 when Sleep / voice-only).
-        if cursor && t == VisionTier::Active && force_stub {
+        if cursor && t == VisionTier::Active {
             let ms = start.elapsed().as_millis() as u64;
-            let sample = stub_sample(ms % 10_000);
+            let hand = latest_hand.lock().clone();
+            let sample = match hand.as_ref().and_then(hand_frame_to_sample) {
+                Some(s) => s,
+                // Presence-only / no landmarks: keep scripted stub path for CI.
+                None if force_stub => stub_sample(ms % 10_000),
+                None => HandSample::absent(),
+            };
             let tick = engine.on_sample(ms, sample);
             apply_g07_tray(&app, &tier, &tick.g07_events);
             apply_g08_memos(&app, &tick.memo_events);

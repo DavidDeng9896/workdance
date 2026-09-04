@@ -3,7 +3,7 @@ name = "workdance-input"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "WP2–WP3 gesture classify, focus lock, G07 ASR append, serial inject"
+description = "WP2–WP5 / WP-M2 gesture classify, landmark→G02–G05, focus, G07, serial inject"
 
 [features]
 default = []
