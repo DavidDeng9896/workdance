@@ -9,23 +9,22 @@
 <body>
   <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
     <div>
-      <h1>WorkDance · 校准</h1>
-      <p class="sub">前置自拍平面四点校准骨架 · WP0 无实机预览</p>
+      <h1>校准</h1>
+      <p class="sub">请用食指依次指向屏幕四角，完成前置平面校准</p>
     </div>
-    <button class="btn" id="toSettings" type="button">设置</button>
+    <button class="btn btn-sm" id="toSettings" type="button">设置</button>
   </header>
 
   <div class="cal-stage" aria-label="calibration stage">
-    <div class="corner tl active">+</div>
+    <div class="corner tl active" data-corner="0"></div>
     <div class="corner-hint">用食指指向此角</div>
-    <div class="corner tr">+</div>
-    <div class="corner bl">+</div>
-    <div class="corner br">+</div>
+    <div class="corner tr" data-corner="1"></div>
+    <div class="corner bl" data-corner="2"></div>
+    <div class="corner br" data-corner="3"></div>
     <div class="cal-preview">
       <div>
-        <div style="font-size:15px;color:#c9d5e5;margin-bottom:6px;">摄像头预览占位</div>
-        <div class="sub">黑盒 / 设备列表将在 WP1 接入内置前置</div>
-        <div class="sub" id="deviceList" style="margin-top:10px;">设备：未枚举（WP0）</div>
+        <div style="font-size:14px;color:#c9d5e5;margin-bottom:6px;">摄像头预览</div>
+        <div class="sub" id="deviceList">等待内置前置画面</div>
       </div>
     </div>
   </div>
@@ -37,28 +36,42 @@
   </div>
 
   <section class="section">
-    <h2>参数（仅持久化）</h2>
-    <div class="row" style="flex-direction:column;align-items:stretch;">
+    <h2>参数</h2>
+    <div class="row stack">
       <div class="row-title">灵敏度</div>
-      <input id="sensitivity" type="range" min="0" max="100" value="70" />
-      <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
+      <div class="slider-wrap">
+        <input id="sensitivity" type="range" min="0" max="100" value="70" />
+        <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
+      </div>
     </div>
-    <div class="row" style="flex-direction:column;align-items:stretch;">
+    <div class="row stack">
       <div class="row-title">死区</div>
-      <input id="deadZone" type="range" min="0" max="100" value="15" />
-      <div class="slider-labels"><span>更小死区</span><span>更大死区</span></div>
+      <div class="slider-wrap">
+        <input id="deadZone" type="range" min="0" max="100" value="15" />
+        <div class="slider-labels"><span>更小死区</span><span>更大死区</span></div>
+      </div>
     </div>
   </section>
 
   <div class="footer">
-    <button class="btn" id="nextCorner" type="button">下一步（演示）</button>
-    <button class="btn btn-primary" id="confirm" type="button">确认并保存配置</button>
+    <button class="btn" id="nextCorner" type="button">下一步</button>
+    <button class="btn btn-primary" id="confirm" type="button">确认并保存</button>
   </div>
 
   <script src="common.js"></script>
   <script>
     let step = 1;
     const corners = [...document.querySelectorAll(".corner")];
+
+    function syncSliderFill(el) {
+      const min = Number(el.min) || 0;
+      const max = Number(el.max) || 100;
+      const pct = ((Number(el.value) - min) / (max - min)) * 100;
+      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, #2a3340 ${pct}%)`;
+      el.style.backgroundSize = "100% 3px";
+      el.style.backgroundRepeat = "no-repeat";
+      el.style.backgroundPosition = "center";
+    }
 
     function paintStep() {
       corners.forEach((c, i) => c.classList.toggle("active", i === step - 1));
@@ -69,7 +82,29 @@
       });
       const hint = document.querySelector(".corner-hint");
       if (hint) {
-        hint.style.display = step === 1 ? "block" : "none";
+        const active = corners[step - 1];
+        hint.style.display = "block";
+        if (active.classList.contains("tl")) {
+          hint.style.left = "56px";
+          hint.style.right = "auto";
+          hint.style.top = "22px";
+          hint.style.bottom = "auto";
+        } else if (active.classList.contains("tr")) {
+          hint.style.left = "auto";
+          hint.style.right = "56px";
+          hint.style.top = "22px";
+          hint.style.bottom = "auto";
+        } else if (active.classList.contains("bl")) {
+          hint.style.left = "56px";
+          hint.style.right = "auto";
+          hint.style.top = "auto";
+          hint.style.bottom = "22px";
+        } else {
+          hint.style.left = "auto";
+          hint.style.right = "56px";
+          hint.style.top = "auto";
+          hint.style.bottom = "22px";
+        }
       }
     }
 
@@ -87,9 +122,9 @@
           dead_zone,
           confirm: true,
         });
-        WD.toast("校准配置已保存（占位剖面）");
+        WD.toast("校准已保存");
       } catch {
-        WD.toast("预览模式：未写入");
+        WD.toast("当前为预览，未写入");
       }
     };
 
@@ -98,12 +133,19 @@
       catch { location.href = "settings.html"; }
     };
 
+    const sens = document.getElementById("sensitivity");
+    const dead = document.getElementById("deadZone");
+    sens.addEventListener("input", () => syncSliderFill(sens));
+    dead.addEventListener("input", () => syncSliderFill(dead));
+
     (async () => {
       try {
         const cfg = await WD.invoke("get_config");
-        document.getElementById("sensitivity").value = Math.round(cfg.sensitivity * 100);
-        document.getElementById("deadZone").value = Math.round(cfg.dead_zone * 100);
+        sens.value = Math.round(cfg.sensitivity * 100);
+        dead.value = Math.round(cfg.dead_zone * 100);
       } catch {}
+      syncSliderFill(sens);
+      syncSliderFill(dead);
       paintStep();
     })();
   </script>

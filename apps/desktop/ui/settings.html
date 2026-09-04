@@ -9,33 +9,41 @@
 <body>
   <header>
     <h1>WorkDance 设置</h1>
-    <p class="sub">本地配置 · 不上传音视频 · WP0 壳</p>
+    <p class="sub">本地配置 · 音视频不离开本机</p>
   </header>
 
   <section class="section">
     <h2>手势</h2>
     <div class="row">
-      <div>
+      <div class="row-main">
         <div class="row-title">手势总开关</div>
-        <div class="row-desc">开启后托盘显示状态点，可用手势操控（WP1+）</div>
+        <div class="row-desc">开启后托盘显示状态点，可用手势操控</div>
       </div>
-      <label class="switch"><input id="gestureEnabled" type="checkbox" /><span></span></label>
+      <div class="row-control">
+        <label class="switch"><input id="gestureEnabled" type="checkbox" /><span></span></label>
+      </div>
     </div>
-    <div class="row" style="flex-direction:column;align-items:stretch;">
-      <div class="row-title">灵敏度</div>
+    <div class="row stack">
+      <div class="row-head">
+        <div class="row-main">
+          <div class="row-title">灵敏度</div>
+        </div>
+      </div>
       <div class="slider-wrap">
         <input id="sensitivity" type="range" min="0" max="100" value="70" />
         <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
       </div>
     </div>
     <div class="row">
-      <div>
+      <div class="row-main">
         <div class="row-title">摄像头模式</div>
-        <div class="row-desc">性能档优先低延迟（占位）</div>
+        <div class="row-desc">性能档优先更低延迟</div>
       </div>
-      <div class="seg" id="cameraMode">
-        <button type="button" data-value="performance" class="active">性能</button>
-        <button type="button" data-value="hd">高清</button>
+      <div class="row-control">
+        <div class="seg" id="cameraMode">
+          <button type="button" data-value="performance" class="active">性能</button>
+          <button type="button" data-value="hd">高清</button>
+        </div>
       </div>
     </div>
   </section>
@@ -43,53 +51,62 @@
   <section class="section">
     <h2>语音</h2>
     <div class="row">
-      <div>
+      <div class="row-main">
         <div class="row-title">仅语音兜底</div>
-        <div class="row-desc">关闭手势，保留听写路径（WP3）</div>
+        <div class="row-desc">关闭手势，保留听写路径</div>
       </div>
-      <label class="switch"><input id="voiceOnly" type="checkbox" /><span></span></label>
+      <div class="row-control">
+        <label class="switch"><input id="voiceOnly" type="checkbox" /><span></span></label>
+      </div>
     </div>
     <div class="row">
-      <div>
-        <div class="row-title">ASR 模型</div>
-        <div class="row-desc">占位选择；WP0 不加载模型</div>
+      <div class="row-main">
+        <div class="row-title">听写模型</div>
+        <div class="row-desc">Base 更准，Tiny 更轻</div>
       </div>
-      <div class="seg" id="asrModel">
-        <button type="button" data-value="tiny" class="active">Tiny</button>
-        <button type="button" data-value="base">Base · 更准</button>
+      <div class="row-control">
+        <div class="seg" id="asrModel">
+          <button type="button" data-value="tiny" class="active">Tiny</button>
+          <button type="button" data-value="base">Base · 更准</button>
+        </div>
       </div>
     </div>
   </section>
 
   <section class="section">
     <h2>常规</h2>
-    <div class="row" style="flex-direction:column;align-items:stretch;">
-      <div class="row-title">备忘录路径</div>
-      <div class="row-desc" style="margin-bottom:8px;">听写草稿落盘位置（WP4）</div>
+    <div class="row stack">
+      <div class="row-main">
+        <div class="row-title">备忘录路径</div>
+        <div class="row-desc">听写草稿落盘位置</div>
+      </div>
       <div class="path-field">
         <input id="notesPath" type="text" />
       </div>
     </div>
     <div class="row">
-      <div>
+      <div class="row-main">
         <div class="row-title">开机自启</div>
-        <div class="row-desc">登录后驻留托盘（WP0 仅持久化开关）</div>
+        <div class="row-desc">登录后驻留系统托盘</div>
       </div>
-      <label class="switch"><input id="launchAtStartup" type="checkbox" /><span></span></label>
+      <div class="row-control">
+        <label class="switch"><input id="launchAtStartup" type="checkbox" /><span></span></label>
+      </div>
     </div>
   </section>
 
-  <section class="section">
-    <h2>演示 · 托盘三态</h2>
+  <!-- Dev-only tray state demo; collapsed by default (Lumen QA). -->
+  <details class="dev-demo">
+    <summary>开发演示</summary>
     <div class="row">
       <div id="modePill" class="mode-pill"><span class="dot"></span><span id="modeLabel">休眠</span></div>
       <div style="display:flex;gap:8px;">
-        <button class="btn" id="cycleMode" type="button">手动切换</button>
-        <button class="btn" id="autoMode" type="button">恢复自动</button>
+        <button class="btn btn-sm" id="cycleMode" type="button">手动切换</button>
+        <button class="btn btn-sm" id="autoMode" type="button">恢复自动</button>
       </div>
     </div>
-    <p class="sub">WP1：休眠↔手势开默认由视觉状态机驱动；录音仍为手动 stub（WP3）。</p>
-  </section>
+    <p class="sub" style="margin:0 0 10px;">休眠与手势开默认由视觉状态机驱动；录音仍可手动切换。</p>
+  </details>
 
   <div class="footer space-between">
     <button class="btn btn-ghost" id="openPermissions" type="button">权限</button>
@@ -139,7 +156,7 @@
       pill.classList.remove("gesture", "recording");
       if (view.mode === "gesture_active") {
         pill.classList.add("gesture");
-        label.textContent = view.recording_seconds ? view.label_zh : "手势开";
+        label.textContent = "手势开";
       } else if (view.mode === "recording") {
         pill.classList.add("recording");
         label.textContent = `录音 · ${view.recording_seconds || 0}s`;
@@ -148,17 +165,30 @@
       }
     }
 
+    function syncSliderFill(el) {
+      const min = Number(el.min) || 0;
+      const max = Number(el.max) || 100;
+      const pct = ((Number(el.value) - min) / (max - min)) * 100;
+      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, #2a3340 ${pct}%)`;
+      el.style.backgroundSize = "100% 3px";
+      el.style.backgroundRepeat = "no-repeat";
+      el.style.backgroundPosition = "center";
+    }
+
     WD.bindSeg(document.getElementById("cameraMode"), (v) => (state.camera_mode = v));
     WD.bindSeg(document.getElementById("asrModel"), (v) => (state.asr_model = v));
+
+    const sens = document.getElementById("sensitivity");
+    sens.addEventListener("input", () => syncSliderFill(sens));
 
     document.getElementById("save").onclick = async () => {
       try {
         const saved = await WD.invoke("save_settings", { patch: readForm() });
         Object.assign(state, saved);
         fill();
-        WD.toast("已保存到本地配置");
+        WD.toast("已保存");
       } catch (e) {
-        WD.toast("预览模式：未写入（需桌面壳）");
+        WD.toast("当前为预览，未写入本地配置");
       }
     };
 
@@ -183,9 +213,9 @@
       try {
         const view = await WD.invoke("clear_manual_override");
         paintMode(view);
-        WD.toast("已恢复视觉自动档");
+        WD.toast("已恢复自动");
       } catch {
-        WD.toast("预览模式：无视觉线程");
+        WD.toast("当前为预览");
       }
     };
 
@@ -203,10 +233,12 @@
         const cfg = await WD.invoke("get_config");
         Object.assign(state, cfg);
         fill();
+        syncSliderFill(sens);
         const mode = await WD.invoke("get_mode");
         paintMode(mode);
       } catch {
         fill();
+        syncSliderFill(sens);
         paintMode({ mode: "sleep", label_zh: "休眠", recording_seconds: 0 });
       }
     })();
