@@ -4,6 +4,7 @@
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
 - 当前实现：**WP0–WP5（v1 壳完整切片）**
+- 下一步：真 MediaPipe Hands + 离线中文 ASR 集成计划 — [docs/specs/2026-09-04-mediapipe-asr-plan.md](docs/specs/2026-09-04-mediapipe-asr-plan.md)
 
 ## 架构
 
