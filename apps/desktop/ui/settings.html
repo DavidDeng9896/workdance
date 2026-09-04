@@ -78,11 +78,22 @@
     <div class="row stack">
       <div class="row-main">
         <div class="row-title">备忘录路径</div>
-        <div class="row-desc">听写草稿落盘位置</div>
+        <div class="row-desc">G08 听写草稿落盘位置（仅 Markdown，不存音频）</div>
       </div>
       <div class="path-field">
         <input id="notesPath" type="text" />
       </div>
+    </div>
+    <div class="row stack">
+      <div class="row-main">
+        <div class="row-title">备忘搜索</div>
+        <div class="row-desc">按标题/正文子串过滤本地 MD</div>
+      </div>
+      <div class="path-field" style="display:flex;gap:8px;align-items:center;">
+        <input id="notesQuery" type="text" placeholder="关键词…" style="flex:1;" />
+        <button class="btn btn-sm" id="searchNotes" type="button">搜索</button>
+      </div>
+      <pre id="notesHits" class="sub" style="margin:8px 0 0;white-space:pre-wrap;max-height:120px;overflow:auto;"></pre>
     </div>
     <div class="row">
       <div class="row-main">
@@ -226,6 +237,23 @@
     document.getElementById("openPermissions").onclick = async () => {
       try { await WD.invoke("open_named_window", { label: "permissions" }); }
       catch { location.href = "permissions.html"; }
+    };
+
+    document.getElementById("searchNotes").onclick = async () => {
+      const query = document.getElementById("notesQuery").value.trim();
+      const out = document.getElementById("notesHits");
+      try {
+        const hits = await WD.invoke("search_notes", { query });
+        if (!hits.length) {
+          out.textContent = "（无匹配）";
+          return;
+        }
+        out.textContent = hits
+          .map((h) => `${h.title}\n  ${h.path}\n  ${h.snippet}`)
+          .join("\n\n");
+      } catch (e) {
+        out.textContent = String(e);
+      }
     };
 
     (async () => {

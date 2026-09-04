@@ -26,7 +26,7 @@ pub struct AppConfig {
     pub sensitivity: f32,
     /// Dead-zone radius 0.0–1.0 for calibration (persist only in WP0).
     pub dead_zone: f32,
-    /// Directory for future MD memo drafts (WP4).
+    /// Directory for MD memo drafts (WP4 G08).
     pub notes_path: String,
     /// Launch at login stub (not wired to OS autostart in WP0).
     pub launch_at_startup: bool,

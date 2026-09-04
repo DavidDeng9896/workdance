@@ -6,6 +6,8 @@ use crate::g07::{G07Event, G07Machine};
 
 /// Max fist hold that still counts as G03 click.
 pub const SHORT_FIST_MAX: u64 = 300;
+/// G08 double short-fist window (second short release within this after the first).
+pub const G08_WINDOW_MS: u64 = 500;
 
 /// Openness below this ⇒ fist; at/above OPEN_PALM ⇒ open palm.
 const FIST_MAX_OPENNESS: f32 = 0.35;
@@ -78,6 +80,12 @@ pub enum InjectCommand {
     AppendText { text: String },
 }
 
+/// WP4 G08: request to persist a markdown memo (no audio).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoEvent {
+    SaveRequested { body: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FistPhase {
     Idle,
@@ -87,11 +95,12 @@ enum FistPhase {
     LongHold,
 }
 
-/// Result of one engine tick (inject intents + G07 tray signals).
+/// Result of one engine tick (inject intents + G07/G08 signals).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct EngineTick {
     pub commands: Vec<InjectCommand>,
     pub g07_events: Vec<G07Event>,
+    pub memo_events: Vec<MemoEvent>,
 }
 
 /// Maps hand samples + vision tier → inject intents (no OS calls).
@@ -112,6 +121,10 @@ pub struct GestureEngine {
     probe: Box<dyn FocusProbe>,
     g07: G07Machine,
     asr: Box<dyn AsrBackend>,
+    /// After a short-fist release, second short fist before this deadline ⇒ G08.
+    g08_arm_until: Option<u64>,
+    /// Last finished G07 transcript (in-memory only; never audio).
+    last_transcript: String,
 }
 
 impl GestureEngine {
@@ -134,6 +147,8 @@ impl GestureEngine {
             probe: create_default_focus_probe(),
             g07: G07Machine::new(),
             asr: create_default_asr(),
+            g08_arm_until: None,
+            last_transcript: String::new(),
         }
     }
 
@@ -155,6 +170,10 @@ impl GestureEngine {
         self.g07.is_recording()
     }
 
+    pub fn last_transcript(&self) -> &str {
+        &self.last_transcript
+    }
+
     pub fn set_tier(&mut self, tier: VisionTier) {
         if tier == VisionTier::Sleep {
             self.reset_motion();
@@ -169,7 +188,8 @@ impl GestureEngine {
         self.smooth_y.reset();
         self.fist = FistPhase::Idle;
         self.swipe_armed = true;
-        // Focus lock intentionally kept across gesture move / brief absence.
+        self.g08_arm_until = None;
+        // Focus lock + last_transcript intentionally kept.
     }
 
     fn screen_from_norm(&self, sx: f32, sy: f32) -> (i32, i32) {
@@ -189,6 +209,30 @@ impl GestureEngine {
         self.focus.on_hover(now_ms, hit);
     }
 
+    fn remember_transcript_from_g07(&mut self, events: &[G07Event]) {
+        for ev in events {
+            if let G07Event::DictationReady { text } = ev {
+                self.last_transcript = text.clone();
+            }
+        }
+    }
+
+    /// G08: stop recording if active, then request memo save from last/just-finished transcript.
+    fn fire_g08(&mut self, now_ms: u64, out: &mut EngineTick) {
+        if self.g07.is_recording()
+            || matches!(self.g07.phase(), crate::g07::G07Phase::Arming { .. })
+        {
+            self.apply_g07(now_ms, true, false, out);
+        }
+        let body = if self.last_transcript.trim().is_empty() {
+            "(无听写内容)".to_string()
+        } else {
+            self.last_transcript.clone()
+        };
+        out.memo_events
+            .push(MemoEvent::SaveRequested { body });
+    }
+
     fn apply_g07(
         &mut self,
         now_ms: u64,
@@ -197,6 +241,7 @@ impl GestureEngine {
         out: &mut EngineTick,
     ) {
         let events = self.g07.on_sample(now_ms, present, fist, self.asr.as_mut());
+        self.remember_transcript_from_g07(&events);
         for ev in events {
             match &ev {
                 G07Event::DictationReady { text } => {
@@ -239,7 +284,10 @@ impl GestureEngine {
         let raw_prev = self.last_raw;
         self.last_raw = Some((sample.x, sample.y));
 
-        // --- Fist state machine (G03 / G04) ---
+        // --- Fist state machine (G03 / G04 / G08 double short-fist) ---
+        // Heuristic: two short-fist releases (<SHORT_FIST_MAX) within G08_WINDOW_MS
+        // ⇒ G08 memo (second release suppresses ClickLeft). Distinct from G05 swipe-down
+        // and G07 long-fist ≥1s.
         match self.fist {
             FistPhase::Idle => {
                 if sample.is_fist() {
@@ -252,11 +300,24 @@ impl GestureEngine {
                 if sample.is_fist() {
                     if now_ms.saturating_sub(since_ms) >= SHORT_FIST_MAX {
                         self.fist = FistPhase::LongHold;
+                        self.g08_arm_until = None;
                     }
                 } else if sample.is_open_palm() {
                     let held = now_ms.saturating_sub(since_ms);
                     if held < SHORT_FIST_MAX {
-                        out.commands.push(InjectCommand::ClickLeft);
+                        let is_g08 = self
+                            .g08_arm_until
+                            .map(|until| now_ms <= until)
+                            .unwrap_or(false);
+                        if is_g08 {
+                            self.g08_arm_until = None;
+                            self.fire_g08(now_ms, &mut out);
+                        } else {
+                            out.commands.push(InjectCommand::ClickLeft);
+                            self.g08_arm_until = Some(now_ms.saturating_add(G08_WINDOW_MS));
+                        }
+                    } else {
+                        self.g08_arm_until = None;
                     }
                     self.fist = FistPhase::Idle;
                 } else {
@@ -266,12 +327,20 @@ impl GestureEngine {
             FistPhase::LongHold => {
                 if sample.is_open_palm() {
                     self.fist = FistPhase::Idle;
+                    self.g08_arm_until = None;
                 }
             }
         }
 
         // G07: long fist ≥1s → record; leave/release handled inside machine.
-        self.apply_g07(now_ms, true, sample.is_fist(), &mut out);
+        // Skip feeding fist=true into G07 on the same tick we already force-released for G08.
+        let skip_g07_fist = out
+            .memo_events
+            .iter()
+            .any(|e| matches!(e, MemoEvent::SaveRequested { .. }));
+        if !skip_g07_fist {
+            self.apply_g07(now_ms, true, sample.is_fist(), &mut out);
+        }
         let recording = self.g07.is_recording();
 
         // --- Motion: G02 move vs G04 scroll vs G05 swipe ---
@@ -577,5 +646,72 @@ mod tests {
         let _ = e.on_sample(1450, HandSample::fist(0.55, 0.6));
         assert_eq!(e.focus_lock().locked(), Some(&t));
         assert!(e.is_recording());
+    }
+
+    #[test]
+    fn g08_double_short_fist_requests_memo() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        // First short fist → click + arm G08 window.
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let first = e.on_sample(100, HandSample::open_palm(0.5, 0.5));
+        assert!(first
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::ClickLeft)));
+        assert!(first.memo_events.is_empty());
+        // Second short fist within 500ms → G08, no click.
+        let _ = e.on_sample(150, HandSample::fist(0.5, 0.5));
+        let second = e.on_sample(250, HandSample::open_palm(0.5, 0.5));
+        assert!(!second
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::ClickLeft)));
+        assert!(
+            second
+                .memo_events
+                .iter()
+                .any(|m| matches!(m, MemoEvent::SaveRequested { .. })),
+            "expected G08 SaveRequested, got {:?}",
+            second.memo_events
+        );
+    }
+
+    #[test]
+    fn g08_after_g07_includes_transcript_body() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1010, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1500, HandSample::open_palm(0.5, 0.5));
+        assert!(!e.last_transcript().is_empty());
+        // Double short fist for G08.
+        let _ = e.on_sample(1600, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1700, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(1750, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(1850, HandSample::open_palm(0.5, 0.5));
+        match out.memo_events.as_slice() {
+            [MemoEvent::SaveRequested { body }] => {
+                assert!(body.chars().any(|c| c > '\u{7f}'));
+                assert_eq!(body, e.last_transcript());
+            }
+            other => panic!("expected SaveRequested with transcript, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_short_fist_is_not_g08() {
+        let mut e = engine();
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(100, HandSample::open_palm(0.5, 0.5));
+        assert!(out.memo_events.is_empty());
+        assert!(out
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::ClickLeft)));
     }
 }

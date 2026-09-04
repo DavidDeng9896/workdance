@@ -10,7 +10,9 @@ mod smoother;
 pub use asr::{
     create_default_asr, default_whisper_model_path, AsrBackend, AsrResult, StubAsr,
 };
-pub use engine::{EngineTick, GestureEngine, HandSample, InjectCommand, SHORT_FIST_MAX};
+pub use engine::{
+    EngineTick, GestureEngine, HandSample, InjectCommand, MemoEvent, G08_WINDOW_MS, SHORT_FIST_MAX,
+};
 pub use focus::{
     create_default_focus_probe, FocusLock, FocusProbe, FocusTarget, StubFocusProbe, FOCUS_DWELL_MS,
 };

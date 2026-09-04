@@ -1,4 +1,4 @@
-//! Bridges vision tier → gesture engine → serial inject queue + G07 tray Recording.
+//! Bridges vision tier → gesture engine → serial inject queue + G07 tray + G08 memos.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager};
-use workdance_core::{load_config, AppMode, VisionTier};
+use workdance_core::{load_config, now_stamp, write_memo, AppMode, VisionTier};
 use workdance_input::{
-    create_default_injector, G07Event, GestureEngine, HandSample, InjectQueue,
+    create_default_injector, G07Event, GestureEngine, HandSample, InjectQueue, MemoEvent,
 };
 
 use crate::{tray, AppState};
@@ -92,7 +92,7 @@ fn gesture_loop(
     let start = Instant::now();
     let mut last_tier = VisionTier::Sleep;
     eprintln!(
-        "[workdance-input] gesture loop stub_samples={} (WP3 G07 enabled)",
+        "[workdance-input] gesture loop stub_samples={} (WP3 G07 + WP4 G08)",
         force_stub
     );
 
@@ -106,18 +106,18 @@ fn gesture_loop(
         if t == VisionTier::Active && force_stub {
             let ms = start.elapsed().as_millis() as u64;
             // Looping stub choreography for demo without landmarks.
-            let sample = stub_sample(ms % 9000);
+            let sample = stub_sample(ms % 10_000);
             let tick = engine.on_sample(ms, sample);
             apply_g07_tray(&app, &tier, &tick.g07_events);
+            apply_g08_memos(&app, &tick.memo_events);
             let _ = queue.enqueue_all(tick.commands);
             thread::sleep(Duration::from_millis(32)); // ~30 FPS active
         } else {
-            // Sleep tier or no stub: do not invent motion (开局无误触).
-            // Still tick absence into engine if leaving Active mid-record.
             if engine.is_recording() {
                 let ms = start.elapsed().as_millis() as u64;
                 let tick = engine.on_sample(ms, HandSample::absent());
                 apply_g07_tray(&app, &tier, &tick.g07_events);
+                apply_g08_memos(&app, &tick.memo_events);
                 let _ = queue.enqueue_all(tick.commands);
             }
             thread::sleep(Duration::from_millis(50));
@@ -155,7 +155,28 @@ fn apply_g07_tray(app: &AppHandle, tier: &Arc<Mutex<VisionTier>>, events: &[G07E
     }
 }
 
-/// Deterministic open-palm / fist / swipe / G07 script for CI & stub demos.
+fn apply_g08_memos(app: &AppHandle, events: &[MemoEvent]) {
+    for ev in events {
+        match ev {
+            MemoEvent::SaveRequested { body } => {
+                let notes_path = app.state::<AppState>().config.lock().notes_path.clone();
+                match write_memo(&notes_path, &now_stamp(), body) {
+                    Ok(rec) => {
+                        eprintln!(
+                            "[workdance] G08 memo saved: {}",
+                            rec.path.display()
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("[workdance] G08 memo save failed: {err}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deterministic stub choreography including G08 double short-fist.
 fn stub_sample(ms: u64) -> HandSample {
     // 0–800: open palm drift (G02)
     // 800–1000: short fist → click (G03)
@@ -167,7 +188,11 @@ fn stub_sample(ms: u64) -> HandSample {
     // 3600–4000: open settle
     // 4000–5200: fist hold ≥1s → G07 record
     // 5200–5600: release → stub ASR append
-    // 5600–9000: idle open
+    // 5600–5800: open
+    // 5800–5950: short fist 1 (G08 arm)
+    // 5950–6100: open
+    // 6100–6250: short fist 2 → G08 memo
+    // 6250–10000: idle open
     if ms < 800 {
         let t = ms as f32 / 800.0;
         HandSample::open_palm(0.35 + t * 0.25, 0.45)
@@ -190,6 +215,14 @@ fn stub_sample(ms: u64) -> HandSample {
         HandSample::fist(0.5, 0.5)
     } else if ms < 5600 {
         HandSample::open_palm(0.5, 0.5)
+    } else if ms < 5800 {
+        HandSample::open_palm(0.5, 0.5)
+    } else if ms < 5950 {
+        HandSample::fist(0.5, 0.5)
+    } else if ms < 6100 {
+        HandSample::open_palm(0.5, 0.5)
+    } else if ms < 6250 {
+        HandSample::fist(0.5, 0.5)
     } else {
         HandSample::open_palm(0.5, 0.5)
     }

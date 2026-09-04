@@ -1,7 +1,8 @@
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use workdance_core::{
-    probe_permissions, save_config, AppConfig, AppMode, CalibrationProfile, PermissionsSnapshot,
+    ensure_notes_dir, probe_permissions, save_config, search_memos, AppConfig, AppMode,
+    CalibrationProfile, MemoHit, PermissionsSnapshot,
 };
 
 use crate::{show_window, AppState};
@@ -33,6 +34,7 @@ pub fn save_settings(state: State<'_, AppState>, patch: AppConfig) -> Result<App
         if cfg.voice_only {
             cfg.gesture_enabled = false;
         }
+        ensure_notes_dir(&cfg.notes_path).map_err(|e| e.to_string())?;
         save_config(&cfg).map_err(|e| e.to_string())?;
     }
     let cfg = state.config.lock().clone();
@@ -157,6 +159,24 @@ pub fn save_calibration(
 #[tauri::command]
 pub fn open_named_window(app: AppHandle, label: String) {
     show_window(&app, &label);
+}
+
+/// List / filter markdown memos under configured `notes_path` (WP4).
+#[tauri::command]
+pub fn search_notes(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<MemoHit>, String> {
+    let notes = state.config.lock().notes_path.clone();
+    search_memos(&notes, &query).map_err(|e| e.to_string())
+}
+
+/// Ensure notes directory exists (creates parents). Returns absolute path.
+#[tauri::command]
+pub fn ensure_notes_directory(state: State<'_, AppState>) -> Result<String, String> {
+    let notes = state.config.lock().notes_path.clone();
+    let path = ensure_notes_dir(&notes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Used by tray menu callbacks (manual debug override).

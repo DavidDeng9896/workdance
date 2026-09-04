@@ -3,102 +3,79 @@
 依托普通笔记本 RGB 摄像头 + 麦克风，采用**手势空间操作 + 语音语义录入**的多模态融合交互范式。
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
-- 当前实现：**WP0 壳** + **WP1 双档视觉** + **WP2 手势注入（G02–G05）** + **WP3 焦点锁 + G07 离线听写**
+- 当前实现：**WP0–WP4**（壳 / 双档视觉 / G02–G05 / 焦点+G07 / G08 备忘）
 
 ## 架构
 
-选用 **Tauri 2 + Rust backend**：检测 / 分类 / ASR / 注入均在 **Rust 线程**，不进 JS。
+选用 **Tauri 2 + Rust backend**：检测 / 分类 / ASR / 备忘 / 注入均在 **Rust 线程**，不进 JS。
 
 | Crate | 职责 |
 | --- | --- |
-| `workdance-core` | 配置、托盘态、DualTierMachine |
+| `workdance-core` | 配置、托盘态、DualTierMachine、**MD memo 写入/搜索** |
 | `workdance-vision` | 摄像头、掌存在 detector、双档调度 |
-| `workdance-input` | 手势分类、焦点 dwell、G07、离线 ASR trait、串行 InjectQueue |
-| `apps/desktop` | Tauri 壳；vision → tray；G07 → Recording 托盘态 |
+| `workdance-input` | 手势分类、焦点、G07 ASR、**G08 双短拳**、InjectQueue |
+| `apps/desktop` | Tauri 壳；G07→Recording；G08→写 MD；`search_notes` 命令 |
 
-## WP0 / WP1（摘要）
+## WP0–WP3（摘要）
 
 ```bash
 cargo check --workspace
 cargo test -p workdance-core
 WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
-cd apps/desktop && npm install && npm run build
+cargo test -p workdance-input
 ```
 
-`WORKDANCE_VISION_STUB=1`：无摄像头时脚本化进掌/离掌。托盘休眠↔手势开由状态机驱动。
+详见历史：双档视觉、G02–G05 注入、0.4s 焦点锁、G07 ≥1s 录音 + stub 离线 ASR 追加。
 
-## WP2：光标 / 点击 / 滚轮 / 返回
+## WP4：G08 时间戳 Markdown 备忘
 
-| ID | 动作 | 注入 |
-| --- | --- | --- |
-| G02 | 张掌平移 | `MoveAbs`（自拍镜像 X） |
-| G03 | 短促握拳 &lt;300ms | `ClickLeft`；**&gt;300ms 不当点击** |
-| G04 | 长握后握拳平移 | `Scroll`（G07 录音中抑制） |
-| G05 | 张掌下挥 | `KeyEscape` |
+### 手势启发式（G08）
 
-仅在 `VisionTier::Active` 时产生注入；**Sleep 档绝不移动光标**。
+**双短拳（second short-fist）**：两次握拳均 **&lt;300ms**，且第二次松拳落在第一次松拳后的 **500ms** 窗口内（`G08_WINDOW_MS`）。
 
-## WP3：焦点锁 + G07 离线听写
-
-### 焦点
-
-- 悬停输入框/控件 **0.4s** → 锁焦点（`FocusLock` + `FocusProbe`）
-- 握拳可 **reconfirm** 待定目标
-- **手势移动不解除**已锁焦点、不中断录音
-- Linux：`StubFocusProbe`；Win/Mac：UIA/AX **cfg 占位**（当前回落 stub）
-
-### G07
-
-| 条件 | 行为 |
+| 对比 | 区别 |
 | --- | --- |
-| 握拳 &lt;1s | 不进入录音（短拳仍走 G03） |
-| 握拳 ≥1s | 开始录音（最长 60s）；托盘 → **录音** |
-| 手离镜 | **立刻中止**，不跑 ASR |
-| 松拳 | 内存缓冲 → 离线 ASR → `AppendText` **追加**写入当前焦点 |
-| 结束后 | 托盘回到视觉档对应的 手势开 / 休眠 |
+| G03 | 单次短拳 → 单击；第一次短拳仍单击并武装 G08 窗口 |
+| G05 | 张掌**下挥** → Esc |
+| G07 | 握拳 **≥1s** → 录音 |
+| G08 | 第二次短拳 → 若正在录音则先停录；写入 MD 备忘（**不存音频**） |
 
-### ASR
+正文来自最近一次 G07 `DictationReady` 听写（或强制停录得到的 stub/ASR 文本）；无听写时写 `(无听写内容)`。
 
-- Trait `AsrBackend`；默认 `StubAsr` 返回固定中文「实验记录已追加。」（CI / 无模型）
-- Feature `whisper`：可选本地模型路径（**模型不入库**）
-- 下载：`scripts/download-whisper-tiny.sh`
-- **不上传音频**；缓冲仅内存，测试断言不落盘
+### 备忘文件
 
-### 文本注入
+- 目录：设置里的 `notes_path`（启动 / 保存设置时 `ensure_notes_dir`，缺失则创建）
+- 文件名：`YYYY-MM-DD-HHMMSS.md`
+- 内容：YAML frontmatter（title/created/kind）+ 标题 + 听写正文
+- **从不**写入 wav/mp3 等音频
 
-- `InjectCommand::AppendText` 进入现有串行 `InjectQueue`
-- Win/Mac：Unicode 键盘注入（辅助功能 SetValue 不可用时的回落）
-- Linux：`NullInjector` 接受并丢弃（CI 无副作用）
+### 搜索
 
-### Stub demo（无 mic / 无模型）
+- Rust：`workdance_core::search_memos(notes_path, query)`
+- Tauri：`search_notes` / `ensure_notes_directory`
+- 设置页「备忘搜索」调用上述命令（进程内子串过滤）
+
+### Demo
 
 ```bash
-cargo test -p workdance-input
+cargo test -p workdance-core   # memo 写入 / 搜索 / 建目录 / 无音频
+cargo test -p workdance-input  # G08 双短拳 → SaveRequested
+# 桌面 stub：G07 后接双短拳 → 日志打印 memo 路径
 WORKDANCE_VISION_STUB=1 WORKDANCE_INPUT_STUB=1 cd apps/desktop && npm run tauri -- dev
-# stub 编排含 ≥1s 握拳 → Recording 托盘 → 松拳 AppendText（stub 中文）
 ```
 
 ```bash
-# 可选本地 whisper 模型（不提交）
-./scripts/download-whisper-tiny.sh
-cargo check -p workdance-input --features whisper
+# 纯库演示写备忘
+cargo test -p workdance-core write_memo_creates_timestamped_md -- --nocapture
 ```
 
-### 测试
+## OUT OF SCOPE（截至 WP4）
 
-```bash
-cargo test -p workdance-input
-# dwell 0.4s 锁焦点 / G07 <1s 不录 / ≥1s 开录 / 离镜中止 / 松拳 AppendText / 无音频落盘
-cargo check --workspace
-```
-
-## OUT OF SCOPE（截至 WP3）
-
-- G08 备忘录 MD 落盘（仅后续 WP4；本切片无 memo 文件保存）
-- 托盘「仅语音」产品化 / 设置页完整打磨 — WP5
+- 云同步、完整 ELN
+- 托盘「仅语音」产品化 / 设置页全面打磨 — WP5
 - 云 API、遥测、Word/仪器适配
 - 精细框选 / 拖拽 / 空中键盘
-- 将 MediaPipe / whisper 权重提交进仓
+- MediaPipe / whisper 权重入库
 
 ## Linux CI 依赖
 

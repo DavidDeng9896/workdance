@@ -1,4 +1,4 @@
-//! WorkDance desktop shell (WP0–WP3). G08 memo / full settings polish later.
+//! WorkDance desktop shell (WP0–WP4). WP5 voice-only polish later.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -9,7 +9,7 @@ mod vision_bridge;
 
 use parking_lot::Mutex;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-use workdance_core::{load_config, AppConfig, RuntimeState};
+use workdance_core::{ensure_notes_dir, load_config, AppConfig, RuntimeState};
 use workdance_vision::VisionWorker;
 
 use crate::input_bridge::InputBridge;
@@ -25,6 +25,9 @@ pub struct AppState {
 pub fn run() {
     let config = load_config().unwrap_or_default();
     let show_first_run = !config.first_run_done;
+    if let Err(err) = ensure_notes_dir(&config.notes_path) {
+        eprintln!("[workdance] notes dir: {err}");
+    }
 
     let state = AppState {
         config: Mutex::new(config),
@@ -49,6 +52,8 @@ pub fn run() {
             commands::save_calibration,
             commands::get_config_path,
             commands::open_named_window,
+            commands::search_notes,
+            commands::ensure_notes_directory,
         ])
         .setup(move |app| {
             tray::build_tray(app.handle())?;
