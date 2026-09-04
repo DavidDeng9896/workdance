@@ -7,3 +7,7 @@ apps/desktop/src-tauri/target
 *.log
 .idea
 .vscode
+# Model blobs (download via scripts/; never commit)
+**/models/**
+*.task
+*.onnx

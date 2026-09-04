@@ -62,6 +62,25 @@ h2 {
   max-width: 36em;
 }
 
+.banner {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  border: 1px solid var(--line);
+}
+.banner-warn {
+  background: rgba(226, 85, 85, 0.12);
+  border-color: rgba(226, 85, 85, 0.35);
+  color: #f0c4c4;
+}
+.banner-ok {
+  background: rgba(62, 207, 142, 0.1);
+  border-color: rgba(62, 207, 142, 0.3);
+  color: #b8f0d4;
+}
+
 .section {
   background: linear-gradient(180deg, rgba(255,255,255,0.025), transparent 40%), var(--bg-panel);
   border: 1px solid var(--line);

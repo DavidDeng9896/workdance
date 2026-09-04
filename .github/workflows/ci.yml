@@ -45,6 +45,10 @@ jobs:
           cargo test -p workdance-vision
           cargo test -p workdance-input
 
+      # Feature compiles via libloading (no native MediaPipe required).
+      - name: cargo check mediapipe-hands feature
+        run: cargo check -p workdance-vision --features mediapipe-hands
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:

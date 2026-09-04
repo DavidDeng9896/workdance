@@ -13,6 +13,8 @@ pub enum VisionTier {
 }
 
 /// One frame of palm-presence evidence from a detector backend.
+///
+/// Kept as the DualTierMachine input contract (WP-M1 does not change thresholds).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PalmObservation {
     /// True when a palm/hand is considered present in frame.
@@ -24,6 +26,73 @@ pub struct PalmObservation {
 impl PalmObservation {
     pub fn valid_palm(self) -> bool {
         self.present && self.confidence >= MIN_PALM_CONFIDENCE
+    }
+}
+
+/// Normalized 3D landmark (image coords in \[0, 1\] for x/y).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandLandmark {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// Extended hand observation for MediaPipe / landmarker backends (WP-M1).
+///
+/// DualTierMachine still consumes [`PalmObservation`]; convert via [`HandFrame::as_palm`]
+/// / [`From`]. Landmarks are optional and **not** wired into G02–G05 yet (WP-M2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandFrame {
+    pub present: bool,
+    pub confidence: f32,
+    /// MediaPipe Hands 21 landmarks when Active / full path produced them.
+    pub landmarks: Option<[HandLandmark; 21]>,
+}
+
+impl HandFrame {
+    pub fn absent() -> Self {
+        Self {
+            present: false,
+            confidence: 0.0,
+            landmarks: None,
+        }
+    }
+
+    pub fn presence_only(present: bool, confidence: f32) -> Self {
+        Self {
+            present,
+            confidence,
+            landmarks: None,
+        }
+    }
+
+    pub fn as_palm(&self) -> PalmObservation {
+        PalmObservation {
+            present: self.present,
+            confidence: self.confidence,
+        }
+    }
+
+    pub fn valid_palm(&self) -> bool {
+        self.as_palm().valid_palm()
+    }
+}
+
+impl From<HandFrame> for PalmObservation {
+    fn from(h: HandFrame) -> Self {
+        h.as_palm()
+    }
+}
+
+impl From<&HandFrame> for PalmObservation {
+    fn from(h: &HandFrame) -> Self {
+        h.as_palm()
+    }
+}
+
+impl From<PalmObservation> for HandFrame {
+    fn from(p: PalmObservation) -> Self {
+        HandFrame::presence_only(p.present, p.confidence)
     }
 }
 
@@ -212,5 +281,36 @@ mod tests {
             m.observe(t + Duration::from_millis(500 + 1200), palm(0.5)),
             VisionTier::Sleep
         );
+    }
+
+    #[test]
+    fn hand_frame_converts_to_palm_without_changing_thresholds() {
+        let frame = HandFrame {
+            present: true,
+            confidence: 0.9,
+            landmarks: Some([HandLandmark {
+                x: 0.1,
+                y: 0.2,
+                z: 0.0,
+            }; 21]),
+        };
+        let obs: PalmObservation = frame.into();
+        assert!(obs.valid_palm());
+
+        let mut m = DualTierMachine::new();
+        let t = t0();
+        assert_eq!(m.observe(t, obs), VisionTier::Sleep);
+        assert_eq!(
+            m.observe(t + Duration::from_millis(500), obs),
+            VisionTier::Active
+        );
+    }
+
+    #[test]
+    fn hand_frame_absent_has_no_landmarks() {
+        let h = HandFrame::absent();
+        assert!(!h.present);
+        assert!(h.landmarks.is_none());
+        assert!(!h.valid_palm());
     }
 }

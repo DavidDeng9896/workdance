@@ -135,3 +135,15 @@
 ## 10. 明确不改（本 PR）
 
 本文件与 README 链接为**文档-only**。实现落在后续 WP-M* / WP-A* / WP-P PR，不在此变更 Rust 或应用代码。
+
+---
+
+## Appendix A — WP-M1 model pin（实现时锁定）
+
+| 项 | 值 |
+| --- | --- |
+| 文件名 | `hand_landmarker.task` |
+| 本地路径 | `{data_local_dir}/workdance/models/hand_landmarker.task` |
+| URL | `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task` |
+| SHA256 | `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1` |
+| 备注 | CDN 无稳定 lite `.task`；钉 float16 full。脚本：`scripts/download-hand-landmarker.sh` |
