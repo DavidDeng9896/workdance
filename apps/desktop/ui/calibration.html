@@ -31,11 +31,11 @@
     <div class="corner br" data-corner="3"><span class="corner-plus">+</span></div>
 
     <div class="fingertip" id="fingertip" aria-hidden="true"></div>
-    <div class="corner-hint" id="cornerHint">用食指指向此角</div>
+    <div class="corner-hint" id="cornerHint">用食指指向此角，再点下一步</div>
 
     <div class="cal-hud" id="calHud">
       <div class="row-title" id="hudTitle">四点校准 · 进度 1/4</div>
-      <div class="row-desc" id="progressText">请依次指向屏幕四角</div>
+      <div class="row-desc" id="progressText">指向此角后点下一步</div>
       <div class="progress" id="progress"><span class="on"></span><span></span><span></span><span></span></div>
     </div>
   </div>
@@ -103,7 +103,7 @@
     function paintStep() {
       corners.forEach((c, i) => c.classList.toggle("active", i === step - 1));
       document.getElementById("hudTitle").textContent = `四点校准 · 进度 ${step}/4`;
-      document.getElementById("progressText").textContent = "请依次指向屏幕四角";
+      document.getElementById("progressText").textContent = "指向此角后点下一步";
       [...document.getElementById("progress").children].forEach((el, i) => {
         el.classList.toggle("on", i < step);
       });
