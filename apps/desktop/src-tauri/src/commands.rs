@@ -260,6 +260,12 @@ fn mode_view(app: &AppHandle) -> ModeView {
     }
 }
 
+/// WP-M1: vision backend readiness for settings banner (never silent fake).
+#[tauri::command]
+pub fn get_vision_status(app: AppHandle) -> workdance_vision::VisionBackendStatus {
+    vision_bridge::current_vision_status(&app)
+}
+
 /// Used by tray menu callbacks (manual override).
 pub fn apply_mode(app: &AppHandle, mode: AppMode) -> Result<(), String> {
     let state = app.state::<AppState>();

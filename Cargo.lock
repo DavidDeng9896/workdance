@@ -5365,6 +5365,7 @@ name = "workdance-vision"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libloading 0.8.9",
  "ndarray 0.16.1",
  "nokhwa",
  "ort",

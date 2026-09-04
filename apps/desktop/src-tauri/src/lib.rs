@@ -10,7 +10,7 @@ mod vision_bridge;
 use parking_lot::Mutex;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use workdance_core::{ensure_notes_dir, load_config, AppConfig, RuntimeState};
-use workdance_vision::VisionWorker;
+use workdance_vision::{VisionBackendStatus, VisionWorker};
 
 use crate::input_bridge::InputBridge;
 
@@ -18,6 +18,7 @@ pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub runtime: Mutex<RuntimeState>,
     pub vision: Mutex<Option<VisionWorker>>,
+    pub vision_status: Mutex<Option<VisionBackendStatus>>,
     pub input: Mutex<Option<InputBridge>>,
 }
 
@@ -33,6 +34,7 @@ pub fn run() {
         config: Mutex::new(config),
         runtime: Mutex::new(RuntimeState::default()),
         vision: Mutex::new(None),
+        vision_status: Mutex::new(None),
         input: Mutex::new(None),
     };
 
@@ -56,6 +58,7 @@ pub fn run() {
             commands::ensure_notes_directory,
             commands::start_voice_listen,
             commands::stop_voice_listen,
+            commands::get_vision_status,
         ])
         .setup(move |app| {
             tray::build_tray(app.handle())?;

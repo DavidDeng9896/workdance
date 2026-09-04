@@ -7,7 +7,10 @@ use thiserror::Error;
 use workdance_core::{DualTierMachine, VisionTier};
 
 use crate::camera::{CameraCapture, FrameBuffer};
-use crate::detector::{create_default_detector, HandPresenceDetector, ScriptedStubDetector, StubScript};
+use crate::detector::{
+    create_default_detector_with_status, DetectDetail, HandPresenceDetector, ScriptedStubDetector,
+    StubScript, VisionBackendStatus,
+};
 
 #[derive(Debug, Error)]
 pub enum WorkerError {
@@ -37,12 +40,14 @@ impl Default for VisionWorkerConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisionEvent {
     TierChanged {
         from: VisionTier,
         to: VisionTier,
     },
+    /// Backend selection / degradation for UI banner (emitted once at start).
+    BackendStatus(VisionBackendStatus),
 }
 
 /// Background capture + detect + dual-tier loop.
@@ -105,20 +110,32 @@ where
         }
     };
 
-    let mut detector: Box<dyn HandPresenceDetector> = if cfg.force_stub || camera.is_none() {
-        let script = cfg
-            .stub_script
-            .clone()
-            .unwrap_or_else(StubScript::default);
-        Box::new(ScriptedStubDetector::new(script))
-    } else {
-        create_default_detector()
-    };
+    let (mut detector, status): (Box<dyn HandPresenceDetector>, VisionBackendStatus) =
+        if cfg.force_stub || camera.is_none() {
+            let script = cfg
+                .stub_script
+                .clone()
+                .unwrap_or_else(StubScript::default);
+            let reason = if cfg.force_stub {
+                "WORKDANCE_VISION_STUB=1：使用脚本 stub 视觉（CI / 无硬件）".to_string()
+            } else {
+                "摄像头不可用：使用脚本 stub 视觉（非静默假检测路径说明）".to_string()
+            };
+            (
+                Box::new(ScriptedStubDetector::new(script)),
+                VisionBackendStatus::stub_fallback(reason),
+            )
+        } else {
+            create_default_detector_with_status()
+        };
 
+    on_event(VisionEvent::BackendStatus(status.clone()));
     eprintln!(
-        "[workdance-vision] detector={} camera={}",
+        "[workdance-vision] detector={} camera={} status_ok={} msg={}",
         detector.name(),
-        if camera.is_some() { "open" } else { "none/stub" }
+        if camera.is_some() { "open" } else { "none/stub" },
+        status.ok,
+        status.message
     );
 
     let mut machine = DualTierMachine::new();
@@ -139,15 +156,19 @@ where
             placeholder.clone()
         };
 
-        let obs = detector.process_frame(&frame);
-        let tier = machine.observe(Instant::now(), obs);
+        // Sleep: light presence path; Active: full landmarker when available.
+        let detail = match last_tier {
+            VisionTier::Sleep => DetectDetail::PresenceOnly,
+            VisionTier::Active => DetectDetail::FullLandmarks,
+        };
+        let hand = detector.process_frame(&frame, detail);
+        let tier = machine.observe(Instant::now(), hand.as_palm());
         if tier != last_tier {
             on_event(VisionEvent::TierChanged {
                 from: last_tier,
                 to: tier,
             });
             last_tier = tier;
-            // When waking, try bumping camera resolution request next open (best-effort).
             let _ = machine.target_fps();
         }
 
@@ -200,21 +221,29 @@ mod tests {
 
         let mut saw_active = false;
         let mut saw_sleep = false;
+        let mut saw_status = false;
         let deadline = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < deadline && !(saw_active && saw_sleep) {
-            if let Ok(VisionEvent::TierChanged { to, .. }) = rx.recv_timeout(Duration::from_millis(50))
-            {
-                match to {
-                    VisionTier::Active => saw_active = true,
-                    VisionTier::Sleep => {
-                        if saw_active {
-                            saw_sleep = true;
-                        }
+        while Instant::now() < deadline && !(saw_active && saw_sleep && saw_status) {
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
+                match ev {
+                    VisionEvent::BackendStatus(s) => {
+                        assert!(!s.ok);
+                        assert_eq!(s.backend, "stub");
+                        saw_status = true;
                     }
+                    VisionEvent::TierChanged { to, .. } => match to {
+                        VisionTier::Active => saw_active = true,
+                        VisionTier::Sleep => {
+                            if saw_active {
+                                saw_sleep = true;
+                            }
+                        }
+                    },
                 }
             }
         }
         worker.stop();
+        assert!(saw_status, "expected BackendStatus event");
         assert!(saw_active, "expected wake to Active from stub palm");
         assert!(saw_sleep, "expected fall back to Sleep after palm leave");
     }

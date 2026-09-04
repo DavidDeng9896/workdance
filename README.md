@@ -3,7 +3,8 @@
 依托普通笔记本 RGB 摄像头 + 麦克风，采用**手势空间操作 + 语音语义录入**的多模态融合交互范式。
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
-- 当前实现：**WP0–WP5（v1 壳完整切片）**
+- 集成计划：[docs/specs/2026-09-04-mediapipe-asr-plan.md](docs/specs/2026-09-04-mediapipe-asr-plan.md)
+- 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands 后端骨架）**
 
 ## 架构
 
@@ -76,6 +77,47 @@ cd apps/desktop && npm install && npm run tauri -- dev
 | 指哪说哪（浏览器） | Win/Mac 坐标注入 **真**；焦点锁 Linux stub；听写 stub/可选 whisper |
 | 离线 | **真**：无云上传；ASR/视觉本机 |
 | 双端主路径 | Win SendInput / Mac CGEvent **真路径**；Linux null |
+
+## WP-M1：MediaPipe Hands（视觉真路径骨架）
+
+- 观测扩展为 `HandFrame { present, confidence, landmarks: Option<[HandLandmark; 21]> }`；`DualTierMachine` 仍消费 `PalmObservation`（0.5s / 1.2s / conf≥0.6 **未改**）
+- Feature `mediapipe-hands`（**默认关**）：`MediaPipeHandLandmarker` 经 MediaPipe Tasks C API（`libloading` 运行时加载，不硬链）
+- Sleep 档：`PresenceOnly`（无 landmarks）；Active 档：`FullLandmarks`（有则填 21 点）。前置摄像头推理前水平镜像
+- 模型：`hand_landmarker.task` → `dirs::data_local_dir()/workdance/models/`（**不进 git**）
+- `create_default_detector()` 优先级：mediapipe 模型在盘 → `ort-hands` → stub；缺模型 / 打开失败 → stub + **明确** `VisionBackendStatus`（设置页 banner / `get_vision_status`），禁止静默假检测
+- 手势 landmarks **尚未**接入 G02–G05（WP-M2）；ASR / sherpa 不在本切片（WP-A1）
+
+### 下载模型
+
+```bash
+./scripts/download-hand-landmarker.sh
+# 锁定：URL + SHA256 写在脚本内；校验失败非零退出
+```
+
+| 字段 | 值 |
+| --- | --- |
+| URL | `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task` |
+| SHA256 | `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1` |
+
+（CDN 无稳定 lite `.task`；生产钉 float16 full ≈7.5 MB。）
+
+### Win / Mac 启用 MediaPipe
+
+```bash
+# 1) 模型
+./scripts/download-hand-landmarker.sh
+
+# 2) 提供 libmediapipe（从官方 mediapipe PyPI wheel 解出，或自建）
+#    export MEDIAPIPE_LIB=/path/to/libmediapipe.so   # Linux
+#    export MEDIAPIPE_LIB=/path/to/libmediapipe.dylib # macOS
+#    set MEDIAPIPE_LIB=C:\path\mediapipe.dll          # Windows
+
+# 3) 带 feature 编译桌面
+cargo check -p workdance-vision --features mediapipe-hands
+# apps/desktop：在 Cargo.toml 为 workdance-vision 打开 mediapipe-hands 后 tauri build/dev
+```
+
+Linux CI 默认 **stub 绿**（`WORKDANCE_VISION_STUB=1`）；另有 `cargo check --features mediapipe-hands`（无需本机 lib）。
 
 ## OUT OF SCOPE
 

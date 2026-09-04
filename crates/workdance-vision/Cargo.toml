@@ -11,6 +11,8 @@ default = ["camera"]
 camera = ["dep:nokhwa"]
 # Optional ONNX Runtime hand-landmarker backend (requires local model file).
 ort-hands = ["dep:ort", "dep:ndarray"]
+# MediaPipe Tasks Hand Landmarker (dlopen libmediapipe; model .task on disk).
+mediapipe-hands = ["dep:libloading"]
 
 [dependencies]
 workdance-core = { workspace = true }
@@ -21,6 +23,7 @@ dirs = { workspace = true }
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
 ort = { version = "2.0.0-rc.10", optional = true, package = "ort" }
 ndarray = { version = "0.16", optional = true }
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

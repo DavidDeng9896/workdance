@@ -20,6 +20,6 @@ pub use permissions::{PermissionKind, PermissionStatus, PermissionsSnapshot, pro
 pub use state::{AppMode, RuntimeState};
 pub use stubs::{AsrHandle, InjectHandle, VisionHandle};
 pub use tier::{
-    DualTierMachine, PalmObservation, VisionTier, ACTIVE_FPS, MIN_PALM_CONFIDENCE, SLEEP_FPS,
-    SLEEP_HOLD, WAKE_HOLD,
+    DualTierMachine, HandFrame, HandLandmark, PalmObservation, VisionTier, ACTIVE_FPS,
+    MIN_PALM_CONFIDENCE, SLEEP_FPS, SLEEP_HOLD, WAKE_HOLD,
 };

@@ -2,7 +2,7 @@
 
 use tauri::{AppHandle, Manager};
 use workdance_core::{probe_permissions, AppMode, PermissionStatus, VisionTier};
-use workdance_vision::{VisionEvent, VisionWorker, VisionWorkerConfig};
+use workdance_vision::{VisionBackendStatus, VisionEvent, VisionWorker, VisionWorkerConfig};
 
 use crate::{tray, AppState};
 
@@ -57,11 +57,26 @@ pub fn start_vision_worker(app: &AppHandle) -> Result<(), String> {
             apply_vision_tier(&handle, to);
             notify_input(&handle, to);
         }
+        VisionEvent::BackendStatus(status) => {
+            *handle.state::<AppState>().vision_status.lock() = Some(status);
+        }
     })
     .map_err(|e| e.to_string())?;
 
     *app.state::<AppState>().vision.lock() = Some(worker);
     Ok(())
+}
+
+pub fn current_vision_status(app: &AppHandle) -> VisionBackendStatus {
+    app.state::<AppState>()
+        .vision_status
+        .lock()
+        .clone()
+        .unwrap_or_else(|| VisionBackendStatus {
+            backend: "unknown".into(),
+            ok: false,
+            message: "视觉尚未启动".into(),
+        })
 }
 
 fn notify_input(app: &AppHandle, tier: VisionTier) {
