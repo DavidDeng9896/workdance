@@ -1,4 +1,4 @@
-//! WorkDance desktop shell (WP0–WP4). WP5 voice-only polish later.
+//! WorkDance desktop shell (WP0–WP5).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -54,6 +54,8 @@ pub fn run() {
             commands::open_named_window,
             commands::search_notes,
             commands::ensure_notes_directory,
+            commands::start_voice_listen,
+            commands::stop_voice_listen,
         ])
         .setup(move |app| {
             tray::build_tray(app.handle())?;
@@ -75,15 +77,27 @@ pub fn run() {
                 640.0,
             )?;
 
+            // Input always starts (voice-only listen needs it); vision is gated.
             *app.state::<AppState>().input.lock() =
                 Some(InputBridge::start(app.handle().clone()));
-            vision_bridge::start_vision_worker(app.handle())?;
+            {
+                let cfg = app.state::<AppState>().config.lock().clone();
+                if let Some(bridge) = app.state::<AppState>().input.lock().as_ref() {
+                    bridge.apply_policy(cfg.gesture_enabled, cfg.voice_only);
+                }
+            }
 
             if show_first_run {
                 if let Some(w) = app.get_webview_window("permissions") {
                     let _ = w.show();
                     let _ = w.set_focus();
                 }
+                // Defer vision until wizard completes (mark_first_run_done) unless stub.
+                if vision_bridge::may_start_vision(false) {
+                    let _ = vision_bridge::try_start_vision_worker(app.handle())?;
+                }
+            } else {
+                let _ = vision_bridge::try_start_vision_worker(app.handle())?;
             }
 
             Ok(())

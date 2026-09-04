@@ -5,7 +5,7 @@ use workdance_core::{
     CalibrationProfile, MemoHit, PermissionsSnapshot,
 };
 
-use crate::{show_window, AppState};
+use crate::{show_window, vision_bridge, AppState};
 
 #[derive(Serialize)]
 pub struct ModeView {
@@ -14,6 +14,7 @@ pub struct ModeView {
     pub tray_title_zh: String,
     pub recording_seconds: u32,
     pub manual_override: bool,
+    pub voice_only: bool,
 }
 
 #[tauri::command]
@@ -27,29 +28,54 @@ pub fn get_config_path() -> String {
 }
 
 #[tauri::command]
-pub fn save_settings(state: State<'_, AppState>, patch: AppConfig) -> Result<AppConfig, String> {
+pub fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    patch: AppConfig,
+) -> Result<AppConfig, String> {
     {
         let mut cfg = state.config.lock();
         *cfg = patch;
         if cfg.voice_only {
             cfg.gesture_enabled = false;
         }
+        if cfg.asr_language.trim().is_empty() {
+            cfg.asr_language = "zh".into();
+        }
         ensure_notes_dir(&cfg.notes_path).map_err(|e| e.to_string())?;
         save_config(&cfg).map_err(|e| e.to_string())?;
     }
     let cfg = state.config.lock().clone();
+    if let Some(bridge) = state.input.lock().as_ref() {
+        bridge.apply_policy(cfg.gesture_enabled, cfg.voice_only);
+    }
+    // Refresh tray tooltip for 仅语音.
+    {
+        let mut rt = state.runtime.lock();
+        if cfg.voice_only && rt.mode == AppMode::GestureActive && !rt.manual_override {
+            rt.mode = AppMode::Sleep;
+        }
+    }
+    crate::tray::refresh_tray(&app)?;
     Ok(cfg)
 }
 
 #[tauri::command]
 pub fn get_mode(state: State<'_, AppState>) -> ModeView {
     let rt = state.runtime.lock();
+    let voice_only = state.config.lock().voice_only;
+    let tray_title_zh = if voice_only {
+        rt.mode.tray_title_voice_only()
+    } else {
+        rt.mode.tray_title_zh()
+    };
     ModeView {
         mode: rt.mode,
         label_zh: rt.mode.label_zh().into(),
-        tray_title_zh: rt.mode.tray_title_zh(),
+        tray_title_zh,
         recording_seconds: rt.recording_seconds,
         manual_override: rt.manual_override,
+        voice_only,
     }
 }
 
@@ -129,10 +155,14 @@ pub fn open_os_permission_settings() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn mark_first_run_done(state: State<'_, AppState>) -> Result<(), String> {
-    let mut cfg = state.config.lock();
-    cfg.first_run_done = true;
-    save_config(&cfg).map_err(|e| e.to_string())?;
+pub fn mark_first_run_done(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock();
+        cfg.first_run_done = true;
+        save_config(&cfg).map_err(|e| e.to_string())?;
+    }
+    // Best-effort: start vision after wizard (stub / Granted / Unknown).
+    let _ = vision_bridge::try_start_vision_worker(&app)?;
     Ok(())
 }
 
@@ -163,10 +193,7 @@ pub fn open_named_window(app: AppHandle, label: String) {
 
 /// List / filter markdown memos under configured `notes_path` (WP4).
 #[tauri::command]
-pub fn search_notes(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<Vec<MemoHit>, String> {
+pub fn search_notes(state: State<'_, AppState>, query: String) -> Result<Vec<MemoHit>, String> {
     let notes = state.config.lock().notes_path.clone();
     search_memos(&notes, &query).map_err(|e| e.to_string())
 }
@@ -179,7 +206,61 @@ pub fn ensure_notes_directory(state: State<'_, AppState>) -> Result<String, Stri
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Used by tray menu callbacks (manual debug override).
+/// WP5: arm software listen without fist (仅语音).
+#[tauri::command]
+pub fn start_voice_listen(app: AppHandle) -> Result<ModeView, String> {
+    let state = app.state::<AppState>();
+    {
+        let mut cfg = state.config.lock();
+        cfg.voice_only = true;
+        cfg.gesture_enabled = false;
+        save_config(&cfg).map_err(|e| e.to_string())?;
+    }
+    if let Some(bridge) = state.input.lock().as_ref() {
+        bridge.apply_policy(false, true);
+        bridge.start_voice_listen();
+    }
+    crate::tray::refresh_tray(&app)?;
+    Ok(mode_view(&app))
+}
+
+#[tauri::command]
+pub fn stop_voice_listen(app: AppHandle) -> Result<ModeView, String> {
+    let state = app.state::<AppState>();
+    if let Some(bridge) = state.input.lock().as_ref() {
+        bridge.stop_voice_listen();
+    }
+    {
+        let mut rt = state.runtime.lock();
+        if !rt.manual_override && rt.mode == AppMode::Recording {
+            rt.mode = AppMode::Sleep;
+            rt.recording_seconds = 0;
+        }
+    }
+    crate::tray::refresh_tray(&app)?;
+    Ok(mode_view(&app))
+}
+
+fn mode_view(app: &AppHandle) -> ModeView {
+    let state = app.state::<AppState>();
+    let rt = state.runtime.lock();
+    let voice_only = state.config.lock().voice_only;
+    let tray_title_zh = if voice_only {
+        rt.mode.tray_title_voice_only()
+    } else {
+        rt.mode.tray_title_zh()
+    };
+    ModeView {
+        mode: rt.mode,
+        label_zh: rt.mode.label_zh().into(),
+        tray_title_zh,
+        recording_seconds: rt.recording_seconds,
+        manual_override: rt.manual_override,
+        voice_only,
+    }
+}
+
+/// Used by tray menu callbacks (manual override).
 pub fn apply_mode(app: &AppHandle, mode: AppMode) -> Result<(), String> {
     let state = app.state::<AppState>();
     {

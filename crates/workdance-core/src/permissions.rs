@@ -58,7 +58,7 @@ pub fn probe_permissions() -> PermissionsSnapshot {
         }
     };
 
-    notes.push("摄像头 / 麦克风：WP0 未打开设备，状态为未知（不伪造已允许）。".into());
+    notes.push("摄像头 / 麦克风：未打开设备前为未知；不伪造已允许。首次向导完成后才启动视觉（stub 环境除外）。".into());
 
     PermissionsSnapshot {
         camera: PermissionStatus::Unknown,

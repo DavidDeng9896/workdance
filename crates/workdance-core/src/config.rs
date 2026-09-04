@@ -14,26 +14,28 @@ pub enum ConfigError {
     TomlSer(#[from] toml::ser::Error),
 }
 
-/// Local WP0 settings. Fields that affect sensing later are stored now but unused.
+/// Local settings (WP0–WP5). Sensing / inject / ASR fields are live.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     /// Master gesture enable (tray / settings).
     pub gesture_enabled: bool,
-    /// Voice-only fallback: gestures off, dictation path remains.
+    /// Voice-only fallback: gestures off, dictation path remains (tray listen).
     pub voice_only: bool,
-    /// Gesture sensitivity 0.0–1.0 (persist only in WP0).
+    /// Gesture sensitivity 0.0–1.0 (WP2 smoother / inject scale).
     pub sensitivity: f32,
-    /// Dead-zone radius 0.0–1.0 for calibration (persist only in WP0).
+    /// Dead-zone radius 0.0–1.0 (WP2 motion filter + calibration).
     pub dead_zone: f32,
     /// Directory for MD memo drafts (WP4 G08).
     pub notes_path: String,
-    /// Launch at login stub (not wired to OS autostart in WP0).
+    /// Launch at login stub (not wired to OS autostart).
     pub launch_at_startup: bool,
-    /// Camera mode label: "performance" | "hd" (stub).
+    /// Camera mode label: "performance" | "hd".
     pub camera_mode: String,
-    /// ASR model size label: "tiny" | "base" (stub until WP3).
+    /// ASR model size label: "tiny" | "base".
     pub asr_model: String,
+    /// ASR language code — v1 Chinese dictation (`zh`).
+    pub asr_language: String,
     /// Four-point calibration stub profile.
     pub calibration: CalibrationProfile,
     /// First-run permissions wizard completed (or dismissed).
@@ -51,6 +53,7 @@ impl Default for AppConfig {
             launch_at_startup: true,
             camera_mode: "performance".into(),
             asr_model: "tiny".into(),
+            asr_language: "zh".into(),
             calibration: CalibrationProfile::default(),
             first_run_done: false,
         }
@@ -128,11 +131,31 @@ mod tests {
         cfg.sensitivity = 0.42;
         cfg.dead_zone = 0.2;
         cfg.notes_path = "/tmp/wd-notes".into();
+        cfg.asr_model = "base".into();
+        cfg.asr_language = "zh".into();
+        cfg.camera_mode = "hd".into();
         cfg.calibration.confirmed = true;
         cfg.calibration.corners = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         save_config_to(&path, &cfg).unwrap();
         let loaded = load_config_from(&path).unwrap();
         assert_eq!(loaded, cfg);
+        assert!(loaded.voice_only);
+        assert!(!loaded.gesture_enabled);
+        assert_eq!(loaded.asr_language, "zh");
+    }
+
+    #[test]
+    fn voice_only_and_asr_language_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = AppConfig::default();
+        cfg.voice_only = true;
+        cfg.gesture_enabled = false;
+        cfg.asr_language = "zh".into();
+        save_config_to(&path, &cfg).unwrap();
+        let loaded = load_config_from(&path).unwrap();
+        assert!(loaded.voice_only);
+        assert_eq!(loaded.asr_language, "zh");
     }
 
     #[test]
@@ -142,5 +165,7 @@ mod tests {
         let cfg = load_config_from(&path).unwrap();
         assert!(cfg.gesture_enabled);
         assert!(!cfg.first_run_done);
+        assert_eq!(cfg.asr_language, "zh");
+        assert!(!cfg.voice_only);
     }
 }

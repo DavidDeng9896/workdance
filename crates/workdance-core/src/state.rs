@@ -31,6 +31,14 @@ impl AppMode {
         }
     }
 
+    /// Tray tooltip when voice-only fallback is active.
+    pub fn tray_title_voice_only(self) -> String {
+        match self {
+            Self::Sleep | Self::GestureActive => "WorkDance · 仅语音".into(),
+            Self::Recording => "WorkDance · 听写中".into(),
+        }
+    }
+
     pub fn cycle(self) -> Self {
         match self {
             Self::Sleep => Self::GestureActive,
@@ -86,5 +94,11 @@ mod tests {
             AppMode::from_vision_tier(VisionTier::Active),
             AppMode::GestureActive
         );
+    }
+
+    #[test]
+    fn voice_only_tray_titles() {
+        assert!(AppMode::Sleep.tray_title_voice_only().contains("仅语音"));
+        assert!(AppMode::Recording.tray_title_voice_only().contains("听写"));
     }
 }

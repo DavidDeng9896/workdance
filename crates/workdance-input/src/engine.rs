@@ -125,6 +125,8 @@ pub struct GestureEngine {
     g08_arm_until: Option<u64>,
     /// Last finished G07 transcript (in-memory only; never audio).
     last_transcript: String,
+    /// When false (voice-only), suppress cursor/scroll/key inject; dictation append kept.
+    cursor_enabled: bool,
 }
 
 impl GestureEngine {
@@ -149,6 +151,7 @@ impl GestureEngine {
             asr: create_default_asr(),
             g08_arm_until: None,
             last_transcript: String::new(),
+            cursor_enabled: true,
         }
     }
 
@@ -160,6 +163,27 @@ impl GestureEngine {
     pub fn with_asr(mut self, asr: Box<dyn AsrBackend>) -> Self {
         self.asr = asr;
         self
+    }
+
+    /// WP5 voice-only: disable cursor/scroll/key inject while keeping AppendText path.
+    pub fn set_cursor_enabled(&mut self, enabled: bool) {
+        self.cursor_enabled = enabled;
+        if !enabled {
+            self.reset_motion();
+        }
+    }
+
+    pub fn cursor_enabled(&self) -> bool {
+        self.cursor_enabled
+    }
+
+    fn strip_cursor_commands(commands: &mut Vec<InjectCommand>) {
+        commands.retain(|c| {
+            matches!(
+                c,
+                InjectCommand::AppendText { .. }
+            )
+        });
     }
 
     pub fn focus_lock(&self) -> &FocusLock {
@@ -395,6 +419,9 @@ impl GestureEngine {
         }
 
         self.last_pos = Some((sx, sy));
+        if !self.cursor_enabled {
+            Self::strip_cursor_commands(&mut out.commands);
+        }
         out
     }
 }
@@ -713,5 +740,58 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, InjectCommand::ClickLeft)));
+    }
+
+    #[test]
+    fn voice_only_suppresses_cursor_inject() {
+        let mut e = engine();
+        e.set_tier(VisionTier::Active);
+        e.set_cursor_enabled(false);
+        let _ = e.on_sample(0, HandSample::open_palm(0.4, 0.4));
+        let out = e.on_sample(32, HandSample::open_palm(0.55, 0.4));
+        assert!(
+            out.commands.is_empty(),
+            "voice-only must not move cursor: {:?}",
+            out.commands
+        );
+        let _ = e.on_sample(40, HandSample::fist(0.55, 0.4));
+        let out = e.on_sample(100, HandSample::open_palm(0.55, 0.4));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::ClickLeft)),
+            "voice-only must not click: {:?}",
+            out.commands
+        );
+    }
+
+    #[test]
+    fn voice_only_still_allows_append_text_commands() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        e.set_cursor_enabled(false);
+        // Manually push path: G07 still runs if samples arrive (fist ≥1s).
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1010, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(1500, HandSample::open_palm(0.5, 0.5));
+        assert!(
+            out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::AppendText { .. })),
+            "dictation append must survive voice-only filter: {:?}",
+            out.commands
+        );
+        assert!(
+            !out.commands.iter().any(|c| matches!(
+                c,
+                InjectCommand::MoveAbs { .. }
+                    | InjectCommand::ClickLeft
+                    | InjectCommand::Scroll { .. }
+                    | InjectCommand::KeyEscape
+            )),
+            "no cursor side-effects: {:?}",
+            out.commands
+        );
     }
 }
