@@ -9,8 +9,14 @@ mod landmarks;
 mod smoother;
 
 pub use asr::{
-    create_default_asr, default_whisper_model_path, AsrBackend, AsrResult, StubAsr,
+    asr_model_files_present, asr_stub_allowed, create_asr_with_options, create_default_asr,
+    default_asr_model_dir, default_whisper_model_path, pcm_i16le_mono_to_f32, AsrBackend,
+    AsrBackendStatus, AsrFactoryOptions, AsrResult, StubAsr, UnavailableAsr, ASR_MAX_PCM_BYTES,
+    ASR_MAX_SECONDS, ASR_SAMPLE_RATE_HZ, STUB_ASR_TEXT,
 };
+
+#[cfg(feature = "sherpa-asr")]
+pub use asr::SherpaAsr;
 pub use engine::{
     EngineTick, GestureEngine, HandSample, InjectCommand, MemoEvent, G08_WINDOW_MS, SHORT_FIST_MAX,
 };

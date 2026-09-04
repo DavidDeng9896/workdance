@@ -8,6 +8,7 @@
 </head>
 <body class="skin-apple">
   <div id="visionBanner" class="banner" hidden></div>
+  <div id="asrBanner" class="banner" hidden></div>
 
   <div class="group">
     <h2 class="group-label">手势</h2>
@@ -62,7 +63,7 @@
       <div class="row">
         <div class="row-main">
           <div class="row-title">听写模型</div>
-          <div class="row-desc">Tiny 更快 · Base 更准</div>
+          <div class="row-desc">默认 Paraformer-zh-small（sherpa-onnx）；缺模型时禁用假听写</div>
         </div>
         <div class="row-control">
           <div class="seg" id="asrModel">
@@ -70,6 +71,13 @@
             <button type="button" data-value="base">Base</button>
           </div>
         </div>
+      </div>
+      <div class="row stack">
+        <div class="row-main">
+          <div class="row-title">模型安装状态</div>
+          <div class="row-desc" id="asrModelHint">运行 <code>scripts/download-asr-model.sh</code> 下载并校验 SHA256</div>
+        </div>
+        <div id="asrModelState" class="sub" style="margin:0;">检测中…</div>
       </div>
     </section>
   </div>
@@ -337,6 +345,27 @@
         }
       } catch {
         /* preview / no backend */
+      }
+      try {
+        const as = await WD.invoke("get_asr_status");
+        const banner = document.getElementById("asrBanner");
+        const stateEl = document.getElementById("asrModelState");
+        if (banner && as) {
+          banner.hidden = false;
+          banner.classList.toggle("banner-ok", !!as.ok);
+          banner.classList.toggle("banner-warn", !as.ok);
+          banner.textContent = as.message || (as.ok ? "听写模型就绪" : "听写模型未就绪");
+        }
+        if (stateEl && as) {
+          stateEl.textContent = as.model_installed
+            ? `已安装 · ${as.model_dir}`
+            : `未安装 · 请运行 scripts/download-asr-model.sh`;
+        }
+      } catch {
+        const stateEl = document.getElementById("asrModelState");
+        if (stateEl) {
+          stateEl.textContent = "预览模式 · 请运行 scripts/download-asr-model.sh";
+        }
       }
     })();
   </script>

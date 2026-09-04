@@ -274,6 +274,12 @@ pub fn get_vision_status(app: AppHandle) -> workdance_vision::VisionBackendStatu
     vision_bridge::current_vision_status(&app)
 }
 
+/// WP-A1: ASR model installed / missing for settings banner (never Stub fake).
+#[tauri::command]
+pub fn get_asr_status() -> workdance_input::AsrBackendStatus {
+    workdance_input::AsrBackendStatus::probe()
+}
+
 /// Used by tray menu callbacks (manual override).
 pub fn apply_mode(app: &AppHandle, mode: AppMode) -> Result<(), String> {
     let state = app.state::<AppState>();

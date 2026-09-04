@@ -8,7 +8,10 @@ description = "WP2–WP5 / WP-M2 gesture classify, landmark→G02–G05, focus, 
 [features]
 default = []
 # Optional local whisper.cpp path (model via scripts/download-whisper-tiny.sh; not committed).
+# Quarantined from create_default_asr in WP-A1 (empty placeholder must not be production default).
 whisper = []
+# Offline Chinese ASR via sherpa-onnx Paraformer-zh-small (default OFF; CI stays green).
+sherpa-asr = ["dep:sherpa-onnx"]
 
 [dependencies]
 workdance-core = { workspace = true }
@@ -16,5 +19,6 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 dirs = { workspace = true }
+sherpa-onnx = { version = "1.13.7", optional = true }
 
 [dev-dependencies]
