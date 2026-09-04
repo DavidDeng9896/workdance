@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Visible tray / HUD modes for WP0 stubs (manual cycling for demo).
+use crate::VisionTier;
+
+/// Visible tray / HUD modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppMode {
-    /// Sleep / idle — default. Low-rate palm watch later (WP1).
+    /// Sleep / idle — default. Low-rate palm watch (WP1).
     Sleep,
     /// Gesture active — virtual cursor later (WP2).
     GestureActive,
@@ -36,12 +38,21 @@ impl AppMode {
             Self::Recording => Self::Sleep,
         }
     }
+
+    pub fn from_vision_tier(tier: VisionTier) -> Self {
+        match tier {
+            VisionTier::Sleep => Self::Sleep,
+            VisionTier::Active => Self::GestureActive,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     pub mode: AppMode,
     pub recording_seconds: u32,
+    /// When true, tray ignores vision tier updates (debug manual override).
+    pub manual_override: bool,
 }
 
 impl Default for RuntimeState {
@@ -49,6 +60,7 @@ impl Default for RuntimeState {
         Self {
             mode: AppMode::Sleep,
             recording_seconds: 0,
+            manual_override: false,
         }
     }
 }
@@ -62,5 +74,17 @@ mod tests {
         assert_eq!(AppMode::Sleep.cycle(), AppMode::GestureActive);
         assert_eq!(AppMode::GestureActive.cycle(), AppMode::Recording);
         assert_eq!(AppMode::Recording.cycle(), AppMode::Sleep);
+    }
+
+    #[test]
+    fn vision_tier_maps_to_tray_modes() {
+        assert_eq!(
+            AppMode::from_vision_tier(VisionTier::Sleep),
+            AppMode::Sleep
+        );
+        assert_eq!(
+            AppMode::from_vision_tier(VisionTier::Active),
+            AppMode::GestureActive
+        );
     }
 }

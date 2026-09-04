@@ -83,9 +83,12 @@
     <h2>演示 · 托盘三态</h2>
     <div class="row">
       <div id="modePill" class="mode-pill"><span class="dot"></span><span id="modeLabel">休眠</span></div>
-      <button class="btn" id="cycleMode" type="button">切换状态</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn" id="cycleMode" type="button">手动切换</button>
+        <button class="btn" id="autoMode" type="button">恢复自动</button>
+      </div>
     </div>
-    <p class="sub">WP0 无摄像头：可手动切换 休眠 / 手势开 / 录音。</p>
+    <p class="sub">WP1：休眠↔手势开默认由视觉状态机驱动；录音仍为手动 stub（WP3）。</p>
   </section>
 
   <div class="footer space-between">
@@ -164,7 +167,6 @@
         const view = await WD.invoke("cycle_mode");
         paintMode(view);
       } catch {
-        // preview cycle
         const order = ["sleep", "gesture_active", "recording"];
         const cur = order.indexOf(state._mode || "sleep");
         const next = order[(cur + 1) % 3];
@@ -174,6 +176,16 @@
           label_zh: next,
           recording_seconds: next === "recording" ? 47 : 0,
         });
+      }
+    };
+
+    document.getElementById("autoMode").onclick = async () => {
+      try {
+        const view = await WD.invoke("clear_manual_override");
+        paintMode(view);
+        WD.toast("已恢复视觉自动档");
+      } catch {
+        WD.toast("预览模式：无视觉线程");
       }
     };
 

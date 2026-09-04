@@ -12,6 +12,7 @@ pub struct ModeView {
     pub label_zh: String,
     pub tray_title_zh: String,
     pub recording_seconds: u32,
+    pub manual_override: bool,
 }
 
 #[tauri::command]
@@ -29,7 +30,6 @@ pub fn save_settings(state: State<'_, AppState>, patch: AppConfig) -> Result<App
     {
         let mut cfg = state.config.lock();
         *cfg = patch;
-        // Voice-only implies gestures visually off for tray cycling demos.
         if cfg.voice_only {
             cfg.gesture_enabled = false;
         }
@@ -47,6 +47,7 @@ pub fn get_mode(state: State<'_, AppState>) -> ModeView {
         label_zh: rt.mode.label_zh().into(),
         tray_title_zh: rt.mode.tray_title_zh(),
         recording_seconds: rt.recording_seconds,
+        manual_override: rt.manual_override,
     }
 }
 
@@ -55,6 +56,7 @@ pub fn set_mode(app: AppHandle, state: State<'_, AppState>, mode: AppMode) -> Re
     {
         let mut rt = state.runtime.lock();
         rt.mode = mode;
+        rt.manual_override = true;
         if mode != AppMode::Recording {
             rt.recording_seconds = 0;
         } else if rt.recording_seconds == 0 {
@@ -67,17 +69,30 @@ pub fn set_mode(app: AppHandle, state: State<'_, AppState>, mode: AppMode) -> Re
 
 #[tauri::command]
 pub fn cycle_mode(app: AppHandle, state: State<'_, AppState>) -> Result<ModeView, String> {
-    let next = {
+    {
         let mut rt = state.runtime.lock();
         rt.mode = rt.mode.cycle();
+        rt.manual_override = true;
         if rt.mode == AppMode::Recording {
-            rt.recording_seconds = 47; // demo stub matching Lumen mockup
+            rt.recording_seconds = 47;
         } else {
             rt.recording_seconds = 0;
         }
-        rt.mode
-    };
-    let _ = next;
+    }
+    crate::tray::refresh_tray(&app)?;
+    Ok(get_mode(state))
+}
+
+#[tauri::command]
+pub fn clear_manual_override(app: AppHandle, state: State<'_, AppState>) -> Result<ModeView, String> {
+    {
+        let mut rt = state.runtime.lock();
+        rt.manual_override = false;
+        if rt.mode == AppMode::Recording {
+            rt.mode = AppMode::Sleep;
+            rt.recording_seconds = 0;
+        }
+    }
     crate::tray::refresh_tray(&app)?;
     Ok(get_mode(state))
 }
@@ -91,7 +106,6 @@ pub fn get_permissions() -> PermissionsSnapshot {
 pub fn open_os_permission_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        // Deep-link to Privacy & Security pane (best-effort).
         std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
             .spawn()
@@ -100,7 +114,6 @@ pub fn open_os_permission_settings() -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Open Windows privacy settings landing page.
         std::process::Command::new("cmd")
             .args(["/C", "start", "ms-settings:privacy"])
             .spawn()
@@ -146,12 +159,13 @@ pub fn open_named_window(app: AppHandle, label: String) {
     show_window(&app, &label);
 }
 
-/// Used by tray menu callbacks.
+/// Used by tray menu callbacks (manual debug override).
 pub fn apply_mode(app: &AppHandle, mode: AppMode) -> Result<(), String> {
     let state = app.state::<AppState>();
     {
         let mut rt = state.runtime.lock();
         rt.mode = mode;
+        rt.manual_override = true;
         if mode == AppMode::Recording {
             rt.recording_seconds = 47;
         } else {

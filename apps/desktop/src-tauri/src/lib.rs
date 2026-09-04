@@ -1,18 +1,22 @@
-//! WorkDance desktop shell (WP0).
-//! Tray + settings / permissions / calibration windows. No vision/ASR/inject.
+//! WorkDance desktop shell (WP0 shell + WP1 vision worker).
+//! Tray + settings / permissions / calibration. No ASR / inject (WP2+).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
 mod tray;
+mod vision_bridge;
 
 use parking_lot::Mutex;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use workdance_core::{load_config, AppConfig, RuntimeState};
+use workdance_vision::VisionWorker;
 
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub runtime: Mutex<RuntimeState>,
+    /// Kept so the vision thread is joined on exit.
+    pub vision: Mutex<Option<VisionWorker>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -23,6 +27,7 @@ pub fn run() {
     let state = AppState {
         config: Mutex::new(config),
         runtime: Mutex::new(RuntimeState::default()),
+        vision: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -34,6 +39,7 @@ pub fn run() {
             commands::get_mode,
             commands::set_mode,
             commands::cycle_mode,
+            commands::clear_manual_override,
             commands::get_permissions,
             commands::open_os_permission_settings,
             commands::mark_first_run_done,
@@ -44,7 +50,6 @@ pub fn run() {
         .setup(move |app| {
             tray::build_tray(app.handle())?;
 
-            // Settings window is declared in tauri.conf.json (starts hidden).
             ensure_window(
                 app.handle(),
                 "permissions",
@@ -61,6 +66,8 @@ pub fn run() {
                 900.0,
                 640.0,
             )?;
+
+            vision_bridge::start_vision_worker(app.handle())?;
 
             if show_first_run {
                 if let Some(w) = app.get_webview_window("permissions") {

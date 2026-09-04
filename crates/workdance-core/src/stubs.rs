@@ -1,7 +1,7 @@
-//! Empty hooks for WP1–WP3. Inference and injection must stay on Rust threads —
-//! never in a JS main loop.
+//! Empty hooks for WP2–WP3. WP1 vision lives in `workdance-vision`.
+//! Inference and injection must stay on Rust threads — never in a JS main loop.
 
-/// Placeholder for the MediaPipe Hands / vision worker (WP1).
+/// Legacy WP0 placeholder; prefer [`workdance_vision::VisionWorker`].
 #[derive(Debug, Default)]
 pub struct VisionHandle {
     pub started: bool,
@@ -9,7 +9,6 @@ pub struct VisionHandle {
 
 impl VisionHandle {
     pub fn start_stub(&mut self) {
-        // WP1: spawn capture + MediaPipe thread. No-op in WP0.
         self.started = true;
     }
 
@@ -26,7 +25,6 @@ pub struct AsrHandle {
 
 impl AsrHandle {
     pub fn start_stub(&mut self) {
-        // WP3: load local model, record on G07. No-op in WP0.
         self.started = true;
     }
 
@@ -43,7 +41,6 @@ pub struct InjectHandle {
 
 impl InjectHandle {
     pub fn enqueue_noop(&mut self) {
-        // WP2: serialize click/move/scroll. Must remain empty in WP0.
         self.queue_len = self.queue_len.saturating_add(1);
     }
 

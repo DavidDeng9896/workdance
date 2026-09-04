@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
   "crates/workdance-core",
+  "crates/workdance-vision",
   "apps/desktop/src-tauri",
 ]
 default-members = [
   "crates/workdance-core",
+  "crates/workdance-vision",
   "apps/desktop/src-tauri",
 ]
 
@@ -18,6 +20,7 @@ repository = "https://github.com/DavidDeng9896/workdance"
 
 [workspace.dependencies]
 workdance-core = { path = "crates/workdance-core" }
+workdance-vision = { path = "crates/workdance-vision" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
