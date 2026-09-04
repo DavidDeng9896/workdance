@@ -508,7 +508,7 @@ body.skin-apple {
     "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --display: var(--font);
   color: var(--text);
-  padding: 18px 20px 22px;
+  padding: 14px 20px 20px;
   min-height: 100vh;
 }
 
@@ -524,7 +524,7 @@ body.skin-apple h1 {
   color: var(--text);
 }
 body.skin-apple .eyebrow {
-  color: #8e8e93;
+  color: #8E8E93 !important;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0;
