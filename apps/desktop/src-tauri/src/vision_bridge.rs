@@ -36,10 +36,11 @@ fn notify_input(app: &AppHandle, tier: VisionTier) {
     } else {
         tier
     };
-    let input = state.input.lock();
-    if let Some(bridge) = input.as_ref() {
+    let guard = state.input.lock();
+    if let Some(bridge) = guard.as_ref() {
         bridge.set_tier(effective);
     }
+    drop(guard);
 }
 
 fn apply_vision_tier(app: &AppHandle, tier: VisionTier) {
