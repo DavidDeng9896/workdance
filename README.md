@@ -18,6 +18,95 @@
 | `workdance-input` | 手势 / 焦点 / G07–G08 / 光标门控 / InjectQueue |
 | `apps/desktop` | 托盘三态、仅语音听写、设置、首启权限门禁 |
 
+## Dogfood（真模型）
+
+Mac / Win 真机路径：打开 **`mediapipe-hands` + `sherpa-asr`**，下载并校验模型，跑通 **唤醒 → 单击 → G07**。清单：[docs/dogfood/2026-09-04-dogfood-checklist.md](docs/dogfood/2026-09-04-dogfood-checklist.md)。辅助打印：`./scripts/dogfood-mac.sh` / `pwsh ./scripts/dogfood-win.ps1`。
+
+### Feature flags
+
+| Feature | Crate / 桌面转发 | 默认 |
+| --- | --- | --- |
+| `mediapipe-hands` | `workdance-vision`；桌面 `workdance-desktop/mediapipe-hands` | **OFF** |
+| `sherpa-asr` | `workdance-input`；桌面 `workdance-desktop/sherpa-asr` | **OFF** |
+| `dogfood` | 桌面便捷开关 = 上述两者 | **OFF** |
+
+```bash
+# 编译检查（Linux CI 可编译；无需本机摄像头 / 真跑推理）
+cargo check -p workdance-vision --features mediapipe-hands
+cargo check -p workdance-input --features sherpa-asr
+cargo check -p workdance-desktop --features dogfood
+```
+
+### 下载模型（SHA256 钉死；失败非零退出）
+
+```bash
+./scripts/download-hand-landmarker.sh
+./scripts/download-asr-model.sh
+```
+
+| 模型 | 默认路径（`dirs::data_local_dir()`） | SHA256 |
+| --- | --- | --- |
+| Hand Landmarker `.task` | `{data_local}/workdance/models/hand_landmarker.task` | `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1` |
+| Paraformer-zh-small | `{data_local}/workdance/models/asr/paraformer-zh-small/` | 归档 `da92b3db5218c5be53aad53e57d1b6e63e7fc98a0e054fbdd6dbe18e9c6b1450` |
+
+`data_local`：Linux `~/.local/share`；macOS `~/Library/Application Support`；Windows `%LOCALAPPDATA%`。模型 **不进 git**（`.gitignore`：`**/models/**`、`*.task`、`*.onnx`）。
+
+### 路径 / 环境变量覆盖
+
+| 变量 | 作用 |
+| --- | --- |
+| `WORKDANCE_HAND_MODEL` | 手模型 `.task` 完整路径 |
+| `WORKDANCE_MODEL_DIR` | 模型目录（手模型为 `$DIR/hand_landmarker.task`） |
+| `WORKDANCE_ASR_MODEL_DIR` | ASR 解压根目录（需含 `model.int8.onnx` + `tokens.txt`） |
+| `MEDIAPIPE_LIB` | `libmediapipe.dylib` / `.so` / `mediapipe.dll` 路径（运行时 dlopen） |
+
+**不要**设置 `WORKDANCE_VISION_STUB=1` / `WORKDANCE_ASR_STUB=1` / `WORKDANCE_INPUT_STUB=1`（那些是 CI / stub 演示）。
+
+### Mac / Win 启动桌面
+
+```bash
+# 1) 模型
+./scripts/download-hand-landmarker.sh
+./scripts/download-asr-model.sh
+
+# 2) MediaPipe 动态库（从 mediapipe PyPI wheel 解出或自建）
+export MEDIAPIPE_LIB=/path/to/libmediapipe.dylib   # macOS
+# export MEDIAPIPE_LIB=/path/to/libmediapipe.so     # Linux
+# set MEDIAPIPE_LIB=C:\path\mediapipe.dll            # Windows
+
+# 3) 带 features 跑 Tauri（apps/desktop）
+cd apps/desktop && npm install
+npm run tauri -- dev --features dogfood
+# 等价：--features mediapipe-hands,sherpa-asr
+```
+
+Windows 可用 Git Bash 跑下载脚本，再用 PowerShell：`pwsh ./scripts/dogfood-win.ps1` 打印清单。
+
+### 权限
+
+| 权限 | 用途 |
+| --- | --- |
+| 摄像头 | 掌检测 / 校准 / Continuity |
+| 麦克风 | G07 / 仅语音听写 |
+| 辅助功能（Mac Accessibility）/ 输入注入 | 光标、点击、滚轮、追加文本 |
+
+首启权限窗不完整时会提示；视觉仅在摄像头 Granted（或向导后 Unknown）时启动。
+
+### 如何确认非 stub
+
+| 检查 | 真路径 | stub / 假路径（失败） |
+| --- | --- | --- |
+| 视觉 | 设置 / `get_vision_status` → `backend=mediapipe-hands`，`ok=true` | `backend=stub` / `ScriptedStubDetector`（缺模型或未开 feature） |
+| ASR | `get_asr_status` → `backend=sherpa-asr`，模型已安装；G07 为真实转写 | 固定句 **`实验记录已追加。`**（仅 `WORKDANCE_ASR_STUB=1` / 测试）；或缺模型时 `UnavailableAsr`（空文本，禁止假成功） |
+
+端到端：掌入镜唤醒 → 短拳单击浏览器 → 长握 G07 听写追加。
+
+### Linux CI 说明
+
+- 默认 **不**启用 features、**不**下载模型；`WORKDANCE_VISION_STUB=1` 测 stub。
+- CI 对 `mediapipe-hands` / `sherpa-asr` 做 **compile-only** `cargo check`（无需摄像头；MediaPipe 为 dlopen，缺原生库仍可编译）。
+- 真机 dogfood 仅 Win/Mac；Linux 无辅助功能注入主路径（`NullInjector`）。
+
 ## 端到端 Demo
 
 ### Linux stub（CI / 无硬件）
@@ -32,11 +121,13 @@ WORKDANCE_VISION_STUB=1 WORKDANCE_INPUT_STUB=1 WORKDANCE_ASR_STUB=1 cd apps/desk
 
 ### Windows / macOS（真机主路径）
 
+真模型 dogfood（MediaPipe + Sherpa）：见上方 **[Dogfood（真模型）](#dogfood真模型)**。
+
 ```bash
-cd apps/desktop && npm install && npm run tauri -- dev
+cd apps/desktop && npm install && npm run tauri -- dev --features dogfood
 # 首次：权限向导 → 允许摄像头后启动视觉
 # 手势：掌入镜唤醒 → G02–G05 / G07 录音 / G08 双短拳备忘
-# 仅语音：设置打开「仅语音」或托盘「仅语音 · 开始听写」（无需握拳；松听写 → stub/本地 ASR 追加）
+# 仅语音：设置打开「仅语音」或托盘「仅语音 · 开始听写」（无需握拳；松听写 → 真 ASR / Unavailable）
 ```
 
 | 能力 | Win/Mac | Linux stub |
@@ -104,18 +195,13 @@ cd apps/desktop && npm install && npm run tauri -- dev
 
 ### Win / Mac 启用 MediaPipe
 
+见 **[Dogfood（真模型）](#dogfood真模型)**。摘要：
+
 ```bash
-# 1) 模型
 ./scripts/download-hand-landmarker.sh
-
-# 2) 提供 libmediapipe（从官方 mediapipe PyPI wheel 解出，或自建）
-#    export MEDIAPIPE_LIB=/path/to/libmediapipe.so   # Linux
-#    export MEDIAPIPE_LIB=/path/to/libmediapipe.dylib # macOS
-#    set MEDIAPIPE_LIB=C:\path\mediapipe.dll          # Windows
-
-# 3) 带 feature 编译桌面
+export MEDIAPIPE_LIB=/path/to/libmediapipe.dylib   # 或 .so / mediapipe.dll
 cargo check -p workdance-vision --features mediapipe-hands
-# apps/desktop：在 Cargo.toml 为 workdance-vision 打开 mediapipe-hands 后 tauri build/dev
+# 桌面：npm run tauri -- dev --features mediapipe-hands   # 或 --features dogfood
 ```
 
 Linux CI 默认 **stub 绿**（`WORKDANCE_VISION_STUB=1`）；另有 `cargo check --features mediapipe-hands`（无需本机 lib）。
@@ -167,13 +253,15 @@ WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
 
 ### 启用真转写
 
+见 **[Dogfood（真模型）](#dogfood真模型)**。摘要：
+
 ```bash
 ./scripts/download-asr-model.sh
 cargo check -p workdance-input --features sherpa-asr
-# 桌面：cargo check -p workdance-desktop --features sherpa-asr
+# 桌面：npm run tauri -- dev --features sherpa-asr   # 或 --features dogfood
 ```
 
-CI **不**启用 `sherpa-asr`、**不**下载模型；默认 `cargo test` / `cargo check --workspace` 保持绿。
+CI 默认 **不**启用 `sherpa-asr`、**不**下载模型；另有 compile-only `cargo check -p workdance-input --features sherpa-asr`。默认 `cargo test` / `cargo check --workspace` 保持绿。
 
 ## 下一步（next steps）
 

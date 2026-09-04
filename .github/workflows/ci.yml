@@ -49,6 +49,15 @@ jobs:
       - name: cargo check mediapipe-hands feature
         run: cargo check -p workdance-vision --features mediapipe-hands
 
+      # Feature compiles sherpa-onnx crates (native runtime libs not required for check).
+      # If this fails because of missing system toolchains on a future runner, keep
+      # default workspace check green and treat this as compile-only optional dogfood.
+      - name: cargo check sherpa-asr feature
+        run: cargo check -p workdance-input --features sherpa-asr
+
+      - name: cargo check desktop dogfood features
+        run: cargo check -p workdance-desktop --features dogfood
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Download MediaPipe Hand Landmarker `.task` for feature `mediapipe-hands`.
-# Models are NOT committed. Default destination:
-#   ${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models/hand_landmarker.task
+# Models are NOT committed. Default destination matches dirs::data_local_dir():
+#   Linux:  ${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models/hand_landmarker.task
+#   macOS:  ~/Library/Application Support/workdance/models/hand_landmarker.task
+#   Windows (Git Bash): %LOCALAPPDATA%/workdance/models/hand_landmarker.task
+#
+# Overrides:
+#   WORKDANCE_MODEL_DIR   — models directory (file written as hand_landmarker.task)
+#   WORKDANCE_HAND_MODEL  — full path to .task (Rust reads this; script uses parent dir)
 #
 # Locked asset (WP-M1):
 #   URL:    https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
@@ -12,12 +18,43 @@
 # separate fallback (set WORKDANCE_HAND_ONNX_URL).
 set -euo pipefail
 
-DEST_DIR="${WORKDANCE_MODEL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models}"
+default_data_local() {
+  if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    printf '%s' "$XDG_DATA_HOME"
+    return
+  fi
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      printf '%s' "$HOME/Library/Application Support"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      printf '%s' "${LOCALAPPDATA:-$HOME/AppData/Local}"
+      ;;
+    *)
+      printf '%s' "$HOME/.local/share"
+      ;;
+  esac
+}
+
+if [[ -n "${WORKDANCE_HAND_MODEL:-}" ]]; then
+  DEST="$WORKDANCE_HAND_MODEL"
+  DEST_DIR="$(dirname "$DEST")"
+elif [[ -n "${WORKDANCE_MODEL_DIR:-}" ]]; then
+  DEST_DIR="$WORKDANCE_MODEL_DIR"
+  DEST="$DEST_DIR/hand_landmarker.task"
+else
+  DEST_DIR="$(default_data_local)/workdance/models"
+  DEST="$DEST_DIR/hand_landmarker.task"
+fi
 mkdir -p "$DEST_DIR"
-DEST="$DEST_DIR/hand_landmarker.task"
 
 URL="${WORKDANCE_HAND_TASK_URL:-https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task}"
 SHA256_EXPECTED="${WORKDANCE_HAND_TASK_SHA256:-fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1}"
+
+if [[ -z "$SHA256_EXPECTED" ]]; then
+  echo "SHA256_EXPECTED is empty — refuse to download without a pin" >&2
+  exit 1
+fi
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -54,6 +91,7 @@ fi
 mv "$DEST.partial" "$DEST"
 ls -lh "$DEST"
 echo "sha256 ok: $GOT"
+echo "Rust looks here by default (or set WORKDANCE_HAND_MODEL / WORKDANCE_MODEL_DIR)"
 
 # Optional ORT fallback asset (not required for mediapipe-hands).
 ONNX_DEST="$DEST_DIR/hand_landmarker.onnx"

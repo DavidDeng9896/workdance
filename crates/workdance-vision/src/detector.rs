@@ -260,6 +260,16 @@ pub fn default_mediapipe_model_path() -> PathBuf {
     }
     #[cfg(not(feature = "mediapipe-hands"))]
     {
+        if let Ok(p) = std::env::var("WORKDANCE_HAND_MODEL") {
+            if !p.trim().is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        if let Ok(dir) = std::env::var("WORKDANCE_MODEL_DIR") {
+            if !dir.trim().is_empty() {
+                return PathBuf::from(dir).join("hand_landmarker.task");
+            }
+        }
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("workdance")
@@ -331,8 +341,26 @@ mod tests {
     }
 
     #[test]
-    fn mediapipe_model_path_is_task_bundle() {
+    fn mediapipe_model_path_default_and_env_overrides() {
+        // Env overrides are process-global; keep this in one test and clear after.
+        std::env::remove_var("WORKDANCE_HAND_MODEL");
+        std::env::remove_var("WORKDANCE_MODEL_DIR");
+
         let p = default_mediapipe_model_path();
         assert!(p.ends_with("hand_landmarker.task"), "{}", p.display());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("custom.task");
+        std::env::set_var("WORKDANCE_HAND_MODEL", &file);
+        assert_eq!(default_mediapipe_model_path(), file);
+        std::env::remove_var("WORKDANCE_HAND_MODEL");
+
+        let dir = tmp.path().join("models");
+        std::env::set_var("WORKDANCE_MODEL_DIR", &dir);
+        assert_eq!(
+            default_mediapipe_model_path(),
+            dir.join("hand_landmarker.task")
+        );
+        std::env::remove_var("WORKDANCE_MODEL_DIR");
     }
 }

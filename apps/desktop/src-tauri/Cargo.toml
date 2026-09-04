@@ -25,5 +25,9 @@ parking_lot = { workspace = true }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-# Forward WP-A1 sherpa ASR (default OFF; CI does not enable).
+# Forward WP-M1 MediaPipe Hands (default OFF; dlopen — compiles without native lib).
+mediapipe-hands = ["workdance-vision/mediapipe-hands"]
+# Forward WP-A1 sherpa ASR (default OFF; CI does not enable by default).
 sherpa-asr = ["workdance-input/sherpa-asr"]
+# Convenience: both real backends for Mac/Win dogfood (still needs models + native libs).
+dogfood = ["mediapipe-hands", "sherpa-asr"]

@@ -29,6 +29,16 @@ pub const HAND_LANDMARKER_SHA256: &str =
     "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1";
 
 pub fn default_mediapipe_model_path() -> PathBuf {
+    if let Ok(p) = std::env::var("WORKDANCE_HAND_MODEL") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(dir) = std::env::var("WORKDANCE_MODEL_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir).join("hand_landmarker.task");
+        }
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("workdance")
@@ -221,15 +231,40 @@ fn candidate_lib_paths() -> Vec<PathBuf> {
         out.push(PathBuf::from(p));
     }
     if let Some(cache) = dirs::cache_dir() {
-        // mediapipe-rs / common cache layouts
-        out.push(
-            cache
-                .join("mediapipe-rs")
-                .join("0.10.35")
-                .join("libmediapipe.so"),
-        );
-        out.push(cache.join("mediapipe-rs").join("libmediapipe.so"));
-        out.push(cache.join("mediapipe").join("libmediapipe.so"));
+        // mediapipe-rs / common cache layouts (platform suffixes)
+        #[cfg(target_os = "macos")]
+        {
+            out.push(
+                cache
+                    .join("mediapipe-rs")
+                    .join("0.10.35")
+                    .join("libmediapipe.dylib"),
+            );
+            out.push(cache.join("mediapipe-rs").join("libmediapipe.dylib"));
+            out.push(cache.join("mediapipe").join("libmediapipe.dylib"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            out.push(
+                cache
+                    .join("mediapipe-rs")
+                    .join("0.10.35")
+                    .join("mediapipe.dll"),
+            );
+            out.push(cache.join("mediapipe-rs").join("mediapipe.dll"));
+            out.push(cache.join("mediapipe").join("mediapipe.dll"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            out.push(
+                cache
+                    .join("mediapipe-rs")
+                    .join("0.10.35")
+                    .join("libmediapipe.so"),
+            );
+            out.push(cache.join("mediapipe-rs").join("libmediapipe.so"));
+            out.push(cache.join("mediapipe").join("libmediapipe.so"));
+        }
     }
     #[cfg(target_os = "macos")]
     {
