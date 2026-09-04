@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkDance Live Chrome</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="live-page">
+  <div class="live-desktop" id="liveDesktop">
+    <div class="live-menubar">
+      <span class="live-menubar-app">WorkDance</span>
+      <div class="live-menubar-right">
+        <div class="mode-pill gesture" id="trayPill">
+          <span class="dot"></span>
+          <span id="trayLabel">手势开</span>
+        </div>
+        <span class="live-clock" id="liveClock"></span>
+      </div>
+    </div>
+
+    <div class="live-browser">
+      <div class="live-browser-chrome">
+        <div class="live-traffic"><i></i><i></i><i></i></div>
+        <div class="live-url">https://eln.lab.local/notes/pcr-47</div>
+      </div>
+      <div class="live-browser-body">
+        <aside class="live-side">
+          <div class="on">今日实验</div>
+          <div>试剂库存</div>
+          <div>协议模板</div>
+        </aside>
+        <main class="live-main">
+          <h1>PCR 扩增 · 批次 #47</h1>
+          <div class="live-field">
+            <label>步骤备注</label>
+            <div class="live-input" id="liveInput">加入 50μL 缓冲液</div>
+          </div>
+          <div class="live-field">
+            <label>试剂用量</label>
+            <div class="live-radio"><span></span> Taq 0.5μL</div>
+          </div>
+          <div class="live-cursor-ring" id="cursorRing" hidden></div>
+          <div class="live-lock" id="liveLock" hidden>光标锁定 · 输入框</div>
+        </main>
+      </div>
+    </div>
+
+    <div class="continuity-pip live-pip" id="pip" data-mode="gesture">
+      <canvas class="pip-feed pip-feed-mock" id="pipMock" width="360" height="240"></canvas>
+      <canvas class="pip-skeleton" id="pipSkeleton" width="180" height="120" aria-hidden="true"></canvas>
+      <div class="pip-label">前置</div>
+      <div class="pip-status on" id="pipStatus"></div>
+      <div class="pip-rec" id="pipRec" hidden>REC</div>
+      <div class="pip-wave" id="pipWave" hidden>
+        <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      </div>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const scene = params.get("scene") || "gesture"; // gesture | recording
+    const pip = document.getElementById("pip");
+    const pill = document.getElementById("trayPill");
+    const label = document.getElementById("trayLabel");
+
+    function applyScene(name) {
+      const isRec = name === "recording";
+      pip.dataset.mode = isRec ? "recording" : "gesture";
+      document.getElementById("pipRec").hidden = !isRec;
+      document.getElementById("pipWave").hidden = !isRec;
+      document.getElementById("pipStatus").hidden = isRec;
+      pill.classList.toggle("gesture", !isRec);
+      pill.classList.toggle("recording", isRec);
+      label.textContent = isRec ? "录音 · 12s" : "手势开";
+      document.getElementById("cursorRing").hidden = isRec;
+      document.getElementById("liveLock").hidden = !isRec;
+      document.getElementById("liveInput").classList.toggle("locked", isRec);
+    }
+
+    function tickClock() {
+      const d = new Date();
+      const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      document.getElementById("liveClock").textContent =
+        `${days[d.getDay()]} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    }
+
+    (function () {
+      applyScene(scene);
+      tickClock();
+      const mock = document.getElementById("pipMock");
+      const ctx = mock.getContext("2d");
+      // Draw at 2x then CSS scales to ~180×120.
+      WD.drawDemoHand(ctx, mock.width, mock.height, { compact: true });
+      const sk = document.getElementById("pipSkeleton");
+      const skCtx = sk.getContext("2d");
+      WD.drawFaintSkeleton(skCtx, WD.mockHandLandmarks(sk.width, sk.height), {
+        tipIndex: 8,
+        accent: scene === "recording" ? "#e25555" : "#3b82f6",
+      });
+    })();
+  </script>
+</body>
+</html>
