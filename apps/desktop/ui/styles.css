@@ -13,6 +13,7 @@
   --accent-soft: rgba(59, 130, 246, 0.16);
   --danger: #e25555;
   --ok: #3ecf8e;
+  --slider-track: #2a3340;
   --radius: 12px;
   --font: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   --display: "Space Grotesk", "IBM Plex Sans", "Noto Sans SC", sans-serif;
@@ -477,3 +478,400 @@ details.dev-demo > summary::before {
 }
 details.dev-demo[open] > summary::before { content: "▾ "; }
 details.dev-demo .row { padding-left: 0; padding-right: 0; }
+
+/* ============================================================
+   Apple light System Settings — settings + permissions only.
+   Calibration keeps the dark live-camera chrome above.
+   ============================================================ */
+html:has(body.skin-apple),
+body.skin-apple {
+  background: #f2f2f7;
+  min-height: 100%;
+}
+body.skin-apple {
+  --bg-deep: #f2f2f7;
+  --bg-panel: #ffffff;
+  --bg-row: #ffffff;
+  --bg-row-hover: #f7f7f9;
+  --line: rgba(60, 60, 67, 0.12);
+  --line-strong: rgba(60, 60, 67, 0.18);
+  --text: #1c1c1e;
+  --muted: #8e8e93;
+  --accent: #007aff;
+  --accent-deep: #007aff;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --danger: #ff3b30;
+  --ok: #34c759;
+  --slider-track: #d1d1d6;
+  --radius: 10px;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --display: var(--font);
+  color: var(--text);
+  padding: 14px 20px 20px;
+  min-height: 100vh;
+}
+
+body.skin-apple h1,
+body.skin-apple h2,
+body.skin-apple h3 {
+  font-family: var(--font);
+  letter-spacing: -0.01em;
+}
+body.skin-apple h1 {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+}
+body.skin-apple .eyebrow {
+  color: #8E8E93 !important;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  margin-bottom: 6px;
+}
+body.skin-apple .sub {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 6px;
+  max-width: 34em;
+}
+
+body.skin-apple .banner {
+  margin-top: 0;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  border: none;
+  background: rgba(0, 122, 255, 0.08);
+  color: #636366;
+}
+body.skin-apple .banner-warn {
+  background: rgba(255, 59, 48, 0.1);
+  color: #c0392b;
+}
+body.skin-apple .banner-ok {
+  background: rgba(52, 199, 89, 0.12);
+  color: #1f7a3d;
+}
+
+body.skin-apple .group {
+  margin-top: 16px;
+}
+body.skin-apple .group:first-of-type {
+  margin-top: 4px;
+}
+body.skin-apple .group-label {
+  font-size: 13px;
+  font-weight: 400;
+  color: #6c6c70;
+  letter-spacing: 0;
+  margin: 0 0 6px 14px;
+  text-transform: none;
+}
+body.skin-apple .section {
+  background: var(--bg-panel);
+  border: none;
+  border-radius: 10px;
+  padding: 0 14px;
+  margin-top: 0;
+  box-shadow: none;
+}
+body.skin-apple .section > h2 { display: none; }
+
+body.skin-apple .row {
+  padding: 11px 2px;
+  gap: 14px;
+  min-height: 44px;
+}
+body.skin-apple .row + .row {
+  border-top: 0.5px solid var(--line);
+}
+body.skin-apple .row-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+}
+body.skin-apple .row-desc {
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-top: 2px;
+}
+body.skin-apple .row-control {
+  flex: 0 0 auto;
+  max-width: 58%;
+}
+
+/* Switches — system blue only when on */
+body.skin-apple .switch { width: 51px; height: 31px; }
+body.skin-apple .switch span {
+  background: #e9e9eb;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+}
+body.skin-apple .switch span::after {
+  width: 27px;
+  height: 27px;
+  left: 2px;
+  top: 2px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 1px 1px rgba(0, 0, 0, 0.08);
+}
+body.skin-apple .switch input:checked + span { background: #007aff; }
+body.skin-apple .switch input:checked + span::after { transform: translateX(20px); }
+
+/* Thin right-aligned slider */
+body.skin-apple .slider-inline {
+  width: 118px;
+}
+body.skin-apple input[type="range"] {
+  height: 22px;
+  background: linear-gradient(90deg, var(--accent-deep) 70%, var(--slider-track) 70%);
+  background-size: 100% 3px;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+body.skin-apple input[type="range"]::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+  margin-top: -7.5px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+body.skin-apple input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+}
+body.skin-apple input[type="range"]::-moz-range-track {
+  background: var(--slider-track);
+}
+body.skin-apple input[type="range"]::-moz-range-progress {
+  background: var(--accent-deep);
+}
+
+/* Capsule segmented control */
+body.skin-apple .seg {
+  display: inline-flex;
+  background: #e5e5ea;
+  border: none;
+  border-radius: 999px;
+  padding: 2px;
+  gap: 0;
+}
+body.skin-apple .seg button {
+  color: #1c1c1e;
+  padding: 5px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+}
+body.skin-apple .seg button:hover { color: #1c1c1e; }
+body.skin-apple .seg button.active {
+  color: #1c1c1e;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+}
+
+/* Path row */
+body.skin-apple .path-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 62%;
+  justify-content: flex-end;
+}
+body.skin-apple .path-text {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  text-align: right;
+  width: 150px;
+  max-width: 42vw;
+  padding: 0;
+  outline: none;
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+body.skin-apple .path-field {
+  width: 100%;
+}
+body.skin-apple .path-field input {
+  background: #f2f2f7;
+  border: none;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 11px;
+}
+body.skin-apple .path-field input:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.2);
+}
+
+body.skin-apple .link-btn {
+  border: none;
+  background: transparent;
+  color: #007aff;
+  font: inherit;
+  font-size: 15px;
+  padding: 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+body.skin-apple .link-btn:hover { opacity: 0.75; }
+
+body.skin-apple .btn {
+  border: none;
+  background: #e5e5ea;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: none;
+}
+body.skin-apple .btn:hover { background: #d8d8dd; filter: none; }
+body.skin-apple .btn-primary {
+  background: #007aff;
+  color: #fff;
+  min-width: 72px;
+}
+body.skin-apple .btn-primary:hover { filter: brightness(1.05); background: #007aff; }
+body.skin-apple .btn-ghost,
+body.skin-apple .btn-outline {
+  background: transparent;
+  color: #007aff;
+  border: none;
+}
+
+body.skin-apple .footer {
+  margin-top: 22px;
+  align-items: center;
+}
+body.skin-apple .footer-links {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+body.skin-apple .perm-footer {
+  justify-content: flex-end;
+  gap: 18px;
+}
+
+/* Permissions — single grouped card, no letter blocks / double h1 */
+body.skin-apple .perm-header { margin-bottom: 4px; }
+body.skin-apple .perm-header h1 { margin-top: 0; }
+body.skin-apple .perm-card {
+  margin-top: 16px;
+  padding: 0 4px 0 8px;
+}
+body.skin-apple .perm-item {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 12px 8px 12px 6px;
+  gap: 12px;
+}
+body.skin-apple .perm-item + .perm-item {
+  border-top: 0.5px solid var(--line);
+}
+body.skin-apple .perm-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 0;
+  background: transparent;
+  border: none;
+  color: #3a3a3c;
+}
+body.skin-apple .perm-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+body.skin-apple .status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  cursor: default;
+  font-family: inherit;
+}
+body.skin-apple .status-unk {
+  background: #e5e5ea;
+  color: #636366;
+}
+body.skin-apple .status-ok {
+  background: rgba(52, 199, 89, 0.16);
+  color: #1f7a3d;
+}
+body.skin-apple .status-miss {
+  background: rgba(255, 59, 48, 0.14);
+  color: #c0392b;
+}
+body.skin-apple .status-action {
+  background: #007aff;
+  color: #fff;
+  cursor: pointer;
+}
+body.skin-apple .status-action:hover { filter: brightness(1.05); }
+
+/* Dev demo tucked away from main groups */
+body.skin-apple details.dev-demo {
+  margin-top: 18px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  padding: 0;
+  opacity: 0.55;
+}
+body.skin-apple details.dev-demo[open] {
+  opacity: 1;
+  background: #fff;
+  padding: 0 14px 8px;
+}
+body.skin-apple details.dev-demo > summary {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0;
+  padding: 8px 4px;
+}
+body.skin-apple details.dev-demo > summary::before { color: var(--muted); }
+body.skin-apple .mode-pill {
+  background: #f2f2f7;
+  border: none;
+  color: var(--muted);
+}
+body.skin-apple .mode-pill.gesture .dot {
+  background: #007aff;
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.18);
+}
+body.skin-apple .mode-pill.recording { color: #c0392b; }
+body.skin-apple .dev-actions { display: flex; gap: 8px; }
+body.skin-apple .notes-hits {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow: auto;
+}
+body.skin-apple .toast {
+  background: rgba(28, 28, 30, 0.92);
+  border: none;
+  color: #fff;
+  border-radius: 10px;
+}

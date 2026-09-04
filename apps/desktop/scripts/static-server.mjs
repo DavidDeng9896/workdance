@@ -25,7 +25,10 @@ http
       return;
     }
     const ext = path.extname(fp);
-    res.writeHead(200, { "Content-Type": types[ext] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": types[ext] || "application/octet-stream",
+      "Cache-Control": "no-store",
+    });
     fs.createReadStream(fp).pipe(res);
   })
   .listen(port, () => console.log(`WorkDance UI dev http://localhost:${port}`));
