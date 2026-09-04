@@ -4,6 +4,7 @@
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
 - 集成计划：[docs/specs/2026-09-04-mediapipe-asr-plan.md](docs/specs/2026-09-04-mediapipe-asr-plan.md)
+- WP-A1 边界：[docs/specs/2026-09-04-a1-sherpa-boundary.md](docs/specs/2026-09-04-a1-sherpa-boundary.md)
 - 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands）+ WP-M2（landmark→G02–G05）**
 
 ## 架构
@@ -139,10 +140,18 @@ cargo test -p workdance-input --lib landmarks
 WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
 ```
 
+## 下一步（next steps）
+
+| 切片 | 文档 | 状态 |
+| --- | --- | --- |
+| **WP-A1** | [sherpa-onnx 集成边界](docs/specs/2026-09-04-a1-sherpa-boundary.md) | 边界已定；实现待开（只换 `AsrBackend`；`sherpa-asr` 默认 OFF） |
+| **WP-A2** | 见 [集成计划](docs/specs/2026-09-04-mediapipe-asr-plan.md) §7 | 缺模型 UI；生产禁 Stub 假听写 |
+| **A1.1** | 见 A1 边界 §1 / §4 | VAD / 流式切段（非 A1） |
+
 ## OUT OF SCOPE
 
 - 云同步、术语热词、Word/仪器适配、合并本 PR 之外的发行流程
-- **WP-A1** sherpa ASR（本切片不做）
+- **WP-A1** sherpa ASR **实现**（边界见上；本仓当前切片不做 Rust）
 
 ## Linux CI 依赖
 
