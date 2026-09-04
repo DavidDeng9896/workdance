@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Download Paraformer-zh-small for Cargo feature `sherpa-asr` (WP-A1).
-# Models are NOT committed. Default destination:
-#   ${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models/asr/paraformer-zh-small/
+# Models are NOT committed. Default destination matches dirs::data_local_dir():
+#   Linux:  ${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models/asr/paraformer-zh-small/
+#   macOS:  ~/Library/Application Support/workdance/models/asr/paraformer-zh-small/
+#   Windows (Git Bash): %LOCALAPPDATA%/workdance/models/asr/paraformer-zh-small/
 #
 # Locked asset (WP-A1 boundary):
 #   URL:    https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2
@@ -16,10 +18,33 @@ INNER_DIR="sherpa-onnx-paraformer-zh-small-2024-03-09"
 URL="${WORKDANCE_ASR_ARCHIVE_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${ARCHIVE_NAME}}"
 SHA256_EXPECTED="${WORKDANCE_ASR_ARCHIVE_SHA256:-da92b3db5218c5be53aad53e57d1b6e63e7fc98a0e054fbdd6dbe18e9c6b1450}"
 
+if [[ -z "$SHA256_EXPECTED" ]]; then
+  echo "SHA256_EXPECTED is empty — refuse to download without a pin" >&2
+  exit 1
+fi
+
+default_data_local() {
+  if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    printf '%s' "$XDG_DATA_HOME"
+    return
+  fi
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      printf '%s' "$HOME/Library/Application Support"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      printf '%s' "${LOCALAPPDATA:-$HOME/AppData/Local}"
+      ;;
+    *)
+      printf '%s' "$HOME/.local/share"
+      ;;
+  esac
+}
+
 if [[ -n "${WORKDANCE_ASR_MODEL_DIR:-}" ]]; then
   DEST="$WORKDANCE_ASR_MODEL_DIR"
 else
-  DEST="${XDG_DATA_HOME:-$HOME/.local/share}/workdance/models/asr/paraformer-zh-small"
+  DEST="$(default_data_local)/workdance/models/asr/paraformer-zh-small"
 fi
 
 sha256_file() {
