@@ -1,0 +1,16 @@
+[package]
+name = "workdance-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WorkDance shared config, app state, and WP1+ inference stubs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

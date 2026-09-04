@@ -1,0 +1,25 @@
+[package]
+name = "workdance-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WorkDance WP0 desktop shell (Tauri 2 tray + settings)"
+
+[lib]
+name = "workdance_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+workdance-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+parking_lot = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
