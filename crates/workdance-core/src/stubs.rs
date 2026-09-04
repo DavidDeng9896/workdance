@@ -1,5 +1,4 @@
-//! Empty hooks for WP2–WP3. WP1 vision lives in `workdance-vision`.
-//! Inference and injection must stay on Rust threads — never in a JS main loop.
+//! Empty hooks for WP3+. WP1 = workdance-vision; WP2 = workdance-input.
 
 /// Legacy WP0 placeholder; prefer [`workdance_vision::VisionWorker`].
 #[derive(Debug, Default)]

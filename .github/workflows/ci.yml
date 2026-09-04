@@ -37,12 +37,13 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
-      - name: cargo test (core + vision stub)
+      - name: cargo test (core + vision stub + input)
         env:
           WORKDANCE_VISION_STUB: "1"
         run: |
           cargo test -p workdance-core
           cargo test -p workdance-vision
+          cargo test -p workdance-input
 
       - name: Setup Node
         uses: actions/setup-node@v4

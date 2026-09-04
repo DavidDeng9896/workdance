@@ -1,7 +1,7 @@
-//! Bridges `workdance-vision` dual-tier events into tray AppMode.
+//! Bridges `workdance-vision` dual-tier events into tray AppMode + input inject.
 
 use tauri::{AppHandle, Manager};
-use workdance_core::AppMode;
+use workdance_core::{AppMode, VisionTier};
 use workdance_vision::{VisionEvent, VisionWorker, VisionWorkerConfig};
 
 use crate::{tray, AppState};
@@ -9,7 +9,6 @@ use crate::{tray, AppState};
 pub fn start_vision_worker(app: &AppHandle) -> Result<(), String> {
     let handle = app.clone();
     let cfg = VisionWorkerConfig {
-        // CI / headless: WORKDANCE_VISION_STUB=1 forces scripted palm enter/leave.
         force_stub: VisionWorkerConfig::default().force_stub,
         stub_script: None,
         low_res_camera: true,
@@ -17,7 +16,10 @@ pub fn start_vision_worker(app: &AppHandle) -> Result<(), String> {
 
     let worker = VisionWorker::spawn(cfg, move |ev| {
         match ev {
-            VisionEvent::TierChanged { to, .. } => apply_vision_tier(&handle, to),
+            VisionEvent::TierChanged { to, .. } => {
+                apply_vision_tier(&handle, to);
+                notify_input(&handle, to);
+            }
         }
     })
     .map_err(|e| e.to_string())?;
@@ -26,7 +28,21 @@ pub fn start_vision_worker(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_vision_tier(app: &AppHandle, tier: workdance_core::VisionTier) {
+fn notify_input(app: &AppHandle, tier: VisionTier) {
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().clone();
+    let effective = if !cfg.gesture_enabled || cfg.voice_only {
+        VisionTier::Sleep
+    } else {
+        tier
+    };
+    let input = state.input.lock();
+    if let Some(bridge) = input.as_ref() {
+        bridge.set_tier(effective);
+    }
+}
+
+fn apply_vision_tier(app: &AppHandle, tier: VisionTier) {
     let state = app.state::<AppState>();
     let cfg = state.config.lock().clone();
     if !cfg.gesture_enabled || cfg.voice_only {
@@ -40,7 +56,6 @@ fn apply_vision_tier(app: &AppHandle, tier: workdance_core::VisionTier) {
             return;
         }
         if rt.mode == AppMode::Recording {
-            // Recording is WP3; vision must not clobber it.
             return;
         }
         if rt.mode == next {

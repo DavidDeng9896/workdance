@@ -1,9 +1,9 @@
-//! WorkDance desktop shell (WP0 shell + WP1 vision worker).
-//! Tray + settings / permissions / calibration. No ASR / inject (WP2+).
+//! WorkDance desktop shell (WP0–WP2). No ASR / memo (WP3+).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod input_bridge;
 mod tray;
 mod vision_bridge;
 
@@ -12,11 +12,13 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use workdance_core::{load_config, AppConfig, RuntimeState};
 use workdance_vision::VisionWorker;
 
+use crate::input_bridge::InputBridge;
+
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub runtime: Mutex<RuntimeState>,
-    /// Kept so the vision thread is joined on exit.
     pub vision: Mutex<Option<VisionWorker>>,
+    pub input: Mutex<Option<InputBridge>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -28,6 +30,7 @@ pub fn run() {
         config: Mutex::new(config),
         runtime: Mutex::new(RuntimeState::default()),
         vision: Mutex::new(None),
+        input: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -67,6 +70,7 @@ pub fn run() {
                 640.0,
             )?;
 
+            *app.state::<AppState>().input.lock() = Some(InputBridge::start());
             vision_bridge::start_vision_worker(app.handle())?;
 
             if show_first_run {

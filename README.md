@@ -3,108 +3,89 @@
 依托普通笔记本 RGB 摄像头 + 麦克风，采用**手势空间操作 + 语音语义录入**的多模态融合交互范式。
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
-- 当前实现：**WP0 工程壳** + **WP1 双档视觉**（掌存在 / 休眠↔手势激活）
+- 当前实现：**WP0 壳** + **WP1 双档视觉** + **WP2 手势注入（G02–G05）**
 
 ## 架构
 
-选用 **Tauri 2 + Rust backend**：
+选用 **Tauri 2 + Rust backend**：检测 / 分类 / 注入均在 **Rust 线程**，不进 JS。
 
-1. 设置 / 权限 / 校准多窗口 UI（Lumen dark lab-desk）。
-2. 托盘三态；WP1 起 **休眠 / 手势开** 由视觉状态机驱动（录音仍为手动 stub，待 WP3）。
-3. **检测在 Rust 线程**（`workdance-vision`），不进 JS 主循环。
-
-| Crate / 路径 | 职责 |
+| Crate | 职责 |
 | --- | --- |
-| `crates/workdance-core` | 配置 TOML、托盘态、双档状态机（0.5s 唤醒 / 1.2s 回落 / conf≥0.6） |
-| `crates/workdance-vision` | 摄像头（nokhwa）、`HandPresenceDetector` trait、stub / 可选 ORT、调度线程 |
-| `apps/desktop` | Tauri 壳；把 vision tier 接到托盘 |
+| `workdance-core` | 配置、托盘态、DualTierMachine |
+| `workdance-vision` | 摄像头、掌存在 detector、双档调度 |
+| `workdance-input` | 手势分类、指数平滑、串行 InjectQueue；Win SendInput / Mac CGEvent / Linux null |
+| `apps/desktop` | Tauri 壳；vision → tray；tier → input |
 
-配置：`~/.config/workdance/config.toml`（macOS / Windows 见 `dirs::config_dir`）。
-
-## WP0：如何跑壳
+## WP0 / WP1（摘要）
 
 ```bash
-cargo check
+cargo check --workspace
 cargo test -p workdance-core
-cd apps/desktop && npm install && npm run build
-cd apps/desktop && npm run tauri -- dev   # 需图形会话
-```
-
-仅 UI 预览：`cd apps/desktop && npm run dev` → http://localhost:1420
-
-## WP1：双档视觉
-
-### 行为（锁定规格）
-
-| 档 | FPS | 条件 |
-| --- | --- | --- |
-| Sleep（默认） | 3–5（实现取 4） | 只做掌存在 + 置信度 |
-| Active | 25–30（实现取 27.5） | 掌稳定 ≥0.5s 且 conf ≥0.6 |
-| 回落 Sleep | — | 无有效掌 1.2s |
-
-### Stub 模式（CI / 无摄像头）
-
-```bash
-# 强制脚本化进掌/离掌（默认脚本会触发唤醒与回落）
 WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
-WORKDANCE_VISION_STUB=1 cd apps/desktop && npm run tauri -- dev
+cd apps/desktop && npm install && npm run build
 ```
 
-无摄像头时，即使未设环境变量，worker 也会自动回退 stub，并在 stderr 打印原因。
+`WORKDANCE_VISION_STUB=1`：无摄像头时脚本化进掌/离掌。详见上文历史提交；托盘休眠↔手势开由状态机驱动。
 
-### 真机摄像头
+## WP2：光标 / 点击 / 滚轮 / 返回
+
+### 手势
+
+| ID | 动作 | 注入 |
+| --- | --- | --- |
+| G02 | 张掌平移 | `MoveAbs`（自拍镜像 X） |
+| G03 | 短促握拳 &lt;300ms | `ClickLeft`；**&gt;300ms 不当点击** |
+| G04 | 长握后握拳平移 | `Scroll` |
+| G05 | 张掌下挥 | `KeyEscape`（浏览器返回/关弹窗的 best-effort） |
+
+仅在 `VisionTier::Active` 时产生注入；**Sleep 档绝不移动光标**（开局无误触）。
+
+平滑：指数平滑 + 配置死区（`dead_zone` / `sensitivity`）。串行队列：`workdance-inject` 单线程。
+
+### Stub demo（Linux CI / 无 landmarks）
 
 ```bash
-# 默认 feature `camera`（nokhwa → Linux V4L2 / macOS AVFoundation / Win MF）
-cargo check -p workdance-vision
+cargo test -p workdance-input
+# 桌面：视觉 stub 唤醒后，手势线程用脚本化 HandSample 走 G02–G05
+WORKDANCE_VISION_STUB=1 WORKDANCE_INPUT_STUB=1 cd apps/desktop && npm run tauri -- dev
+```
+
+Linux 默认 **null** 注入后端（接受命令、不碰系统指针）。CI 不需要摄像头或辅助功能权限。
+
+### 真机 OS 注入
+
+| 平台 | 后端 | 权限 |
+| --- | --- | --- |
+| Windows | `SendInput`（`cfg(windows)`） | 一般用户态即可 |
+| macOS | `CGEvent`（`cfg(target_os = "macos")`） | 辅助功能 / 输入监控 |
+| Linux | `NullInjector` | — |
+
+```bash
+# Win / Mac
 cd apps/desktop && npm run tauri -- dev
+# 需 Active 档 + 后续 landmark 源；无模型时可用 INPUT_STUB 脚本演示注入路径
 ```
 
-前置内置摄像头优先（index 0）；sleep 档打开低分辨率（约 320×240）。
-
-Linux 可能需要：`sudo apt-get install -y v4l-utils libv4l-dev`
-
-### 可选 ORT 手部后端（非 CI 默认）
-
-模型**不进仓库**。下载/放置脚本：
-
-```bash
-./scripts/download-hand-landmarker.sh
-# 或手动放到：
-#   Linux: ~/.local/share/workdance/models/hand_landmarker.onnx
-#   macOS: ~/Library/Application Support/workdance/models/hand_landmarker.onnx
-# 体积通常约 5–15 MB（视具体导出而定）
-
-cargo check -p workdance-vision --features ort-hands
-```
-
-Win/Mac 启用步骤：安装摄像头权限 → 放置 ONNX → 带 `ort-hands` 编译桌面壳。无模型时自动回退 stub。
-
-### 托盘与手动覆盖
-
-- 默认：vision 线程驱动 **休眠 ↔ 手势开**
-- 托盘/设置里手动切状态仍可用（debug）；会设 `manual_override`，直到调用「恢复自动」/`clear_manual_override`
-- **录音** 仍为手动 stub（WP3）
+真实手部 landmarks→`HandSample` 依赖 WP1 检测后端输出；当前 stub/CI 用脚本扩展。ORT/MediaPipe 全 landmarks 仍可选、非 WP2 阻断项。
 
 ### 测试
 
 ```bash
-cargo test -p workdance-core          # 含 dual-tier 状态机（无硬件）
-WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
-cargo check --workspace               # CI；无需摄像头
+cargo test -p workdance-input   # 短拳点击 / 长握不点 / sleep 抑制 / 滚 vs 移 / 下挥 Esc
+cargo check --workspace
 ```
 
-## OUT OF SCOPE（截至 WP1）
+## OUT OF SCOPE（截至 WP2）
 
-- G02–G05 / 光标注入（SendInput / CGEvent）— WP2
-- ASR / 录音落盘 — WP3–WP4
+- ASR / 录音 / 备忘录 MD — WP3–WP4
+- 托盘「仅语音」产品化 — WP5
 - 云 API、遥测、Word/仪器适配
+- 精细框选 / 拖拽 / 空中键盘
 
-## Linux CI 系统依赖
+## Linux CI 依赖
 
 ```bash
 sudo apt-get install -y \
   libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-  librsvg2-dev patchelf build-essential libssl-dev libgtk-3-dev \
-  libv4l-dev
+  librsvg2-dev patchelf build-essential libssl-dev libgtk-3-dev libv4l-dev
 ```

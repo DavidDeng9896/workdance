@@ -5345,7 +5345,18 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-shell",
  "workdance-core",
+ "workdance-input",
  "workdance-vision",
+]
+
+[[package]]
+name = "workdance-input"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "thiserror 2.0.20",
+ "workdance-core",
 ]
 
 [[package]]

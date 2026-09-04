@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 workdance-core = { workspace = true }
 workdance-vision = { workspace = true }
+workdance-input = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
