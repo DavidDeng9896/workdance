@@ -167,15 +167,24 @@ fn gesture_loop(
             eprintln!("[workdance] voice-only listen armed (no cursor)");
         }
         if !listening && listen_was_on {
-            // Stop → offline stub ASR → append; no audio files.
+            // Stop → whole-segment offline ASR → append; no audio files.
             let result = asr.transcribe_zh(&[0u8; 64]);
-            let _ = queue.enqueue(InjectCommand::AppendText {
-                text: result.text.clone(),
-            });
-            let notes_path = app.state::<AppState>().config.lock().notes_path.clone();
-            let _ = write_memo(&notes_path, &now_stamp(), &result.text);
+            debug_assert!(result.audio_discarded);
+            if result.text.is_empty() {
+                // UnavailableAsr / empty — never inject StubAsr fixed sentence.
+                eprintln!(
+                    "[workdance] voice-only listen stopped → ASR {} empty (no inject)",
+                    asr.name()
+                );
+            } else {
+                let _ = queue.enqueue(InjectCommand::AppendText {
+                    text: result.text.clone(),
+                });
+                let notes_path = app.state::<AppState>().config.lock().notes_path.clone();
+                let _ = write_memo(&notes_path, &now_stamp(), &result.text);
+                eprintln!("[workdance] voice-only listen stopped → append + memo");
+            }
             set_recording_tray(&app, false);
-            eprintln!("[workdance] voice-only listen stopped → append + memo");
         }
         listen_was_on = listening;
 

@@ -5,7 +5,7 @@
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
 - 集成计划：[docs/specs/2026-09-04-mediapipe-asr-plan.md](docs/specs/2026-09-04-mediapipe-asr-plan.md)
 - WP-A1 边界：[docs/specs/2026-09-04-a1-sherpa-boundary.md](docs/specs/2026-09-04-a1-sherpa-boundary.md)
-- 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands）+ WP-M2（landmark→G02–G05）**
+- 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands）+ WP-M2（landmark→G02–G05）+ WP-A1（Sherpa ASR，feature 默认 OFF）**
 
 ## 架构
 
@@ -27,7 +27,7 @@ cargo check --workspace
 cargo test -p workdance-core
 cargo test -p workdance-input
 WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
-WORKDANCE_VISION_STUB=1 WORKDANCE_INPUT_STUB=1 cd apps/desktop && npm run tauri -- dev
+WORKDANCE_VISION_STUB=1 WORKDANCE_INPUT_STUB=1 WORKDANCE_ASR_STUB=1 cd apps/desktop && npm run tauri -- dev
 ```
 
 ### Windows / macOS（真机主路径）
@@ -43,7 +43,7 @@ cd apps/desktop && npm install && npm run tauri -- dev
 | --- | --- | --- |
 | 双档视觉 | 真摄像头（nokhwa）或 stub | stub |
 | 光标/滚轮/键 | SendInput / CGEvent | NullInjector |
-| G07 听写 | stub ASR 默认；whisper 可选 | stub |
+| G07 听写 | `sherpa-asr`+模型 → 真转写；否则 Unavailable / `WORKDANCE_ASR_STUB=1` | stub（测试） |
 | G08 备忘 MD | 真写入 `notes_path` | 真写入 |
 | 仅语音听写 | 托盘武装听写 | 同左 |
 
@@ -59,7 +59,7 @@ cd apps/desktop && npm install && npm run tauri -- dev
 ### 仅语音
 
 - `voice_only=true` → `gesture_enabled=false`，**光标注入关闭**（`GestureEngine::set_cursor_enabled(false)`）
-- G07 握拳在无视觉 Active 时不可用；改用托盘 **「仅语音 · 开始听写」** 软件武装麦克风听写（内存 → stub ASR → AppendText + 可选 memo），**无需握拳、不移光标**
+- G07 握拳在无视觉 Active 时不可用；改用托盘 **「仅语音 · 开始听写」** 软件武装麦克风听写（内存 PCM → ASR → AppendText + 可选 memo），**无需握拳、不移光标**
 - 配置持久化：`voice_only`、`asr_language=zh`
 
 ### 设置接线
@@ -75,7 +75,7 @@ cd apps/desktop && npm install && npm run tauri -- dev
 | 项 | 状态 |
 | --- | --- |
 | 开局无误触光标 | **真**：Sleep / voice-only 不注入 Move |
-| 指哪说哪（浏览器） | Win/Mac 坐标注入 **真**；焦点锁 Linux stub；听写 stub/可选 whisper |
+| 指哪说哪（浏览器） | Win/Mac 坐标注入 **真**；焦点锁 Linux stub；听写 sherpa / Unavailable（禁 Stub 假句） |
 | 离线 | **真**：无云上传；ASR/视觉本机 |
 | 双端主路径 | Win SendInput / Mac CGEvent **真路径**；Linux null |
 
@@ -86,7 +86,7 @@ cd apps/desktop && npm install && npm run tauri -- dev
 - Sleep 档：`PresenceOnly`（无 landmarks）；Active 档：`FullLandmarks`（有则填 21 点）。前置摄像头推理前水平镜像
 - 模型：`hand_landmarker.task` → `dirs::data_local_dir()/workdance/models/`（**不进 git**）
 - `create_default_detector()` 优先级：mediapipe 模型在盘 → `ort-hands` → stub；缺模型 / 打开失败 → stub + **明确** `VisionBackendStatus`（设置页 banner / `get_vision_status`），禁止静默假检测
-- 手势 landmarks **已**接入 G02–G05（见下方 WP-M2）；ASR / sherpa 不在本切片（WP-A1）
+- 手势 landmarks **已**接入 G02–G05（见下方 WP-M2）；ASR 见 **WP-A1**
 
 ### 下载模型
 
@@ -140,18 +140,53 @@ cargo test -p workdance-input --lib landmarks
 WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
 ```
 
+## WP-A1：sherpa-onnx 离线中文听写
+
+边界：[docs/specs/2026-09-04-a1-sherpa-boundary.md](docs/specs/2026-09-04-a1-sherpa-boundary.md)
+
+- **只换** `AsrBackend`：`SherpaAsr`（feature `sherpa-asr`，**默认 OFF**）；**不改** DualTier / G02–G05 / G07–G08 契约
+- PCM：**16 kHz mono i16 LE**，≤60 s；**永不**写 wav/mp3/raw；`audio_discarded: true`
+- G07 / 仅语音：整段离线 `transcribe_zh`（松拳或满 60 s / 结束听写）
+- 工厂：`sherpa-asr`+模型 → `SherpaAsr`；否则仅 `cfg(test)` 或 `WORKDANCE_ASR_STUB=1` → `StubAsr`；生产缺模型 → **`UnavailableAsr`**（空文本，**禁止**注入 `实验记录已追加。`）
+- 空 whisper 占位已从 `create_default_asr` 隔离（可选 `whisper` feature 仍编译，不进生产默认）
+- 设置页：`get_asr_status` 显示模型已安装 / 缺失，并提示下载脚本
+
+### 下载模型
+
+```bash
+./scripts/download-asr-model.sh
+# 锁定 URL + SHA256；解压到 {data_local}/workdance/models/asr/paraformer-zh-small/
+# 覆盖：WORKDANCE_ASR_MODEL_DIR=/path/to/model-root
+```
+
+| 字段 | 值 |
+| --- | --- |
+| 包名 | `sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2` |
+| URL | `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2` |
+| SHA256 | `da92b3db5218c5be53aad53e57d1b6e63e7fc98a0e054fbdd6dbe18e9c6b1450` |
+
+### 启用真转写
+
+```bash
+./scripts/download-asr-model.sh
+cargo check -p workdance-input --features sherpa-asr
+# 桌面：cargo check -p workdance-desktop --features sherpa-asr
+```
+
+CI **不**启用 `sherpa-asr`、**不**下载模型；默认 `cargo test` / `cargo check --workspace` 保持绿。
+
 ## 下一步（next steps）
 
 | 切片 | 文档 | 状态 |
 | --- | --- | --- |
-| **WP-A1** | [sherpa-onnx 集成边界](docs/specs/2026-09-04-a1-sherpa-boundary.md) | 边界已定；实现待开（只换 `AsrBackend`；`sherpa-asr` 默认 OFF） |
-| **WP-A2** | 见 [集成计划](docs/specs/2026-09-04-mediapipe-asr-plan.md) §7 | 缺模型 UI；生产禁 Stub 假听写 |
+| **WP-A1** | [sherpa-onnx 集成边界](docs/specs/2026-09-04-a1-sherpa-boundary.md) | **已实现**（本切片；feature 默认 OFF） |
+| **WP-A2** | 见 [集成计划](docs/specs/2026-09-04-mediapipe-asr-plan.md) §7 | 缺模型 UI 打磨；whisper 备份产品化 |
 | **A1.1** | 见 A1 边界 §1 / §4 | VAD / 流式切段（非 A1） |
 
 ## OUT OF SCOPE
 
 - 云同步、术语热词、Word/仪器适配、合并本 PR 之外的发行流程
-- **WP-A1** sherpa ASR **实现**（边界见上；本仓当前切片不做 Rust）
+- VAD / 流式 ASR（**A1.1**）；DualTier / G02–G05 / G07–G08 契约变更
 
 ## Linux CI 依赖
 

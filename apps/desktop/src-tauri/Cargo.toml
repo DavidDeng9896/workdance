@@ -25,3 +25,5 @@ parking_lot = { workspace = true }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Forward WP-A1 sherpa ASR (default OFF; CI does not enable).
+sherpa-asr = ["workdance-input/sherpa-asr"]

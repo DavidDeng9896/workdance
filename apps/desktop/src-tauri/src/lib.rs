@@ -59,6 +59,7 @@ pub fn run() {
             commands::start_voice_listen,
             commands::stop_voice_listen,
             commands::get_vision_status,
+            commands::get_asr_status,
         ])
         .setup(move |app| {
             tray::build_tray(app.handle())?;
