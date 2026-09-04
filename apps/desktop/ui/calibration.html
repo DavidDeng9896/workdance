@@ -6,36 +6,41 @@
   <title>WorkDance 校准</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body>
-  <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-    <div>
-      <h1>校准</h1>
-      <p class="sub">请用食指依次指向屏幕四角，完成前置平面校准</p>
+<body class="cal-page">
+  <header class="cal-topbar">
+    <div class="cal-brand">
+      <span class="cal-brand-name">WorkDance</span>
+      <span class="cal-brand-sep">校准</span>
     </div>
-    <button class="btn btn-sm" id="toSettings" type="button">设置</button>
+    <div class="cal-topbar-right">
+      <span class="cal-clock" id="calClock"></span>
+      <button class="btn btn-sm" id="toSettings" type="button">设置</button>
+    </div>
   </header>
+  <div class="cal-submeta">前置 · 镜像</div>
 
-  <div class="cal-stage" aria-label="calibration stage">
-    <div class="corner tl active" data-corner="0"></div>
-    <div class="corner-hint">用食指指向此角</div>
-    <div class="corner tr" data-corner="1"></div>
-    <div class="corner bl" data-corner="2"></div>
-    <div class="corner br" data-corner="3"></div>
-    <div class="cal-preview">
-      <div>
-        <div style="font-size:14px;color:#c9d5e5;margin-bottom:6px;">摄像头预览</div>
-        <div class="sub" id="deviceList">等待内置前置画面</div>
-      </div>
+  <div class="cal-stage no-frame" id="calStage" aria-label="calibration stage">
+    <video class="cal-feed" id="calFeed" playsinline muted autoplay></video>
+    <canvas class="cal-feed cal-feed-mock" id="calMock" hidden></canvas>
+    <div class="cal-vignette" aria-hidden="true"></div>
+    <div class="cal-empty" id="calEmpty">打开摄像头…</div>
+
+    <div class="corner tl active" data-corner="0"><span class="corner-plus">+</span></div>
+    <div class="corner tr" data-corner="1"><span class="corner-plus">+</span></div>
+    <div class="corner bl" data-corner="2"><span class="corner-plus">+</span></div>
+    <div class="corner br" data-corner="3"><span class="corner-plus">+</span></div>
+
+    <div class="fingertip" id="fingertip" aria-hidden="true"></div>
+    <div class="corner-hint" id="cornerHint">用食指指向此角</div>
+
+    <div class="cal-hud" id="calHud">
+      <div class="row-title" id="hudTitle">四点校准 · 进度 1/4</div>
+      <div class="row-desc" id="progressText">请依次指向屏幕四角</div>
+      <div class="progress" id="progress"><span class="on"></span><span></span><span></span><span></span></div>
     </div>
   </div>
 
-  <div class="cal-hud">
-    <div class="row-title">四点校准</div>
-    <div class="row-desc" id="progressText">请依次指向屏幕四角 · 进度 1/4</div>
-    <div class="progress" id="progress"><span class="on"></span><span></span><span></span><span></span></div>
-  </div>
-
-  <section class="section">
+  <section class="section cal-params">
     <h2>参数</h2>
     <div class="row stack">
       <div class="row-title">灵敏度</div>
@@ -62,6 +67,11 @@
   <script>
     let step = 1;
     const corners = [...document.querySelectorAll(".corner")];
+    const stage = document.getElementById("calStage");
+    const tip = document.getElementById("fingertip");
+    const hint = document.getElementById("cornerHint");
+    const params = new URLSearchParams(location.search);
+    const forceDemoFrame = params.get("demo") === "frame" || params.get("frame") === "1";
 
     function syncSliderFill(el) {
       const min = Number(el.min) || 0;
@@ -73,39 +83,39 @@
       el.style.backgroundPosition = "center";
     }
 
+    function placeTipAndHint() {
+      const active = corners[step - 1];
+      const map = {
+        tl: { tip: ["12%", "14%"], hint: { left: "56px", right: "auto", top: "22px", bottom: "auto" } },
+        tr: { tip: ["88%", "14%"], hint: { left: "auto", right: "56px", top: "22px", bottom: "auto" } },
+        bl: { tip: ["12%", "78%"], hint: { left: "56px", right: "auto", top: "auto", bottom: "88px" } },
+        br: { tip: ["88%", "78%"], hint: { left: "auto", right: "56px", top: "auto", bottom: "88px" } },
+      };
+      const key = ["tl", "tr", "bl", "br"].find((k) => active.classList.contains(k)) || "tl";
+      const pos = map[key];
+      tip.style.left = pos.tip[0];
+      tip.style.top = pos.tip[1];
+      tip.classList.add("on");
+      Object.assign(hint.style, pos.hint);
+      hint.style.display = "block";
+    }
+
     function paintStep() {
       corners.forEach((c, i) => c.classList.toggle("active", i === step - 1));
-      document.getElementById("progressText").textContent =
-        `请依次指向屏幕四角 · 进度 ${step}/4`;
+      document.getElementById("hudTitle").textContent = `四点校准 · 进度 ${step}/4`;
+      document.getElementById("progressText").textContent = "请依次指向屏幕四角";
       [...document.getElementById("progress").children].forEach((el, i) => {
         el.classList.toggle("on", i < step);
       });
-      const hint = document.querySelector(".corner-hint");
-      if (hint) {
-        const active = corners[step - 1];
-        hint.style.display = "block";
-        if (active.classList.contains("tl")) {
-          hint.style.left = "56px";
-          hint.style.right = "auto";
-          hint.style.top = "22px";
-          hint.style.bottom = "auto";
-        } else if (active.classList.contains("tr")) {
-          hint.style.left = "auto";
-          hint.style.right = "56px";
-          hint.style.top = "22px";
-          hint.style.bottom = "auto";
-        } else if (active.classList.contains("bl")) {
-          hint.style.left = "56px";
-          hint.style.right = "auto";
-          hint.style.top = "auto";
-          hint.style.bottom = "22px";
-        } else {
-          hint.style.left = "auto";
-          hint.style.right = "56px";
-          hint.style.top = "auto";
-          hint.style.bottom = "22px";
-        }
-      }
+      placeTipAndHint();
+    }
+
+    function tickClock() {
+      const el = document.getElementById("calClock");
+      if (!el) return;
+      const d = new Date();
+      const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      el.textContent = `${days[d.getDay()]} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
     }
 
     document.getElementById("nextCorner").onclick = () => {
@@ -146,7 +156,18 @@
       } catch {}
       syncSliderFill(sens);
       syncSliderFill(dead);
+      tickClock();
+      setInterval(tickClock, 30_000);
       paintStep();
+
+      const preview = await WD.attachFrontPreview({
+        video: document.getElementById("calFeed"),
+        canvas: document.getElementById("calMock"),
+        forceDemo: forceDemoFrame,
+        drawDemo: (ctx, w, h) => WD.drawDemoHand(ctx, w, h, { tipNear: "tl" }),
+      });
+      stage.classList.toggle("has-frame", preview.ok);
+      stage.classList.toggle("no-frame", !preview.ok);
     })();
   </script>
 </body>

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkDance Continuity</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="pip-page">
+  <div class="continuity-pip" id="pip" data-mode="gesture">
+    <video class="pip-feed" id="pipFeed" playsinline muted autoplay></video>
+    <canvas class="pip-feed pip-feed-mock" id="pipMock" hidden></canvas>
+    <canvas class="pip-skeleton" id="pipSkeleton" width="180" height="120" aria-hidden="true"></canvas>
+    <div class="pip-label">前置</div>
+    <div class="pip-status" id="pipStatus" aria-hidden="true"></div>
+    <div class="pip-rec" id="pipRec" hidden>REC</div>
+    <div class="pip-wave" id="pipWave" hidden>
+      <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    const pip = document.getElementById("pip");
+    const params = new URLSearchParams(location.search);
+    const forceMode = params.get("mode"); // gesture | recording
+    const forceDemo = params.get("demo") === "frame" || params.get("frame") === "1" || !window.__TAURI__;
+
+    function applyMode(view) {
+      const mode = forceMode || view?.mode || "gesture_active";
+      const isRec = mode === "recording";
+      pip.dataset.mode = isRec ? "recording" : "gesture";
+      document.getElementById("pipRec").hidden = !isRec;
+      document.getElementById("pipWave").hidden = !isRec;
+      document.getElementById("pipStatus").hidden = isRec;
+      document.getElementById("pipStatus").classList.toggle("on", !isRec);
+    }
+
+    function paintSkeleton(landmarks) {
+      const canvas = document.getElementById("pipSkeleton");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const pts = landmarks || WD.mockHandLandmarks(canvas.width, canvas.height);
+      WD.drawFaintSkeleton(ctx, pts, { tipIndex: 8 });
+    }
+
+    (async () => {
+      applyMode({ mode: forceMode === "recording" ? "recording" : "gesture_active" });
+      await WD.attachFrontPreview({
+        video: document.getElementById("pipFeed"),
+        canvas: document.getElementById("pipMock"),
+        forceDemo,
+        drawDemo: (ctx, w, h) => WD.drawDemoHand(ctx, w, h, { compact: true }),
+      });
+      paintSkeleton(null);
+
+      if (!forceMode) {
+        const tick = async () => {
+          try {
+            const view = await WD.invoke("get_mode");
+            applyMode(view);
+          } catch {}
+        };
+        await tick();
+        setInterval(tick, 800);
+      }
+    })();
+  </script>
+</body>
+</html>

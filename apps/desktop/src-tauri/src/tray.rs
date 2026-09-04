@@ -99,10 +99,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 pub fn refresh_tray(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mode = state.runtime.lock().mode;
+    let (mode, recording_seconds) = {
+        let rt = state.runtime.lock();
+        (rt.mode, rt.recording_seconds)
+    };
     let voice_only = state.config.lock().voice_only;
     let title = if voice_only {
         mode.tray_title_voice_only()
+    } else if mode == AppMode::Recording {
+        format!("WorkDance · 录音 · {recording_seconds}s")
     } else {
         mode.tray_title_zh()
     };
@@ -118,6 +123,7 @@ pub fn refresh_tray(app: &AppHandle) -> Result<(), String> {
     }
     let icon = tray_icon_for_mode(mode).map_err(|e| e.to_string())?;
     tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+    crate::sync_pip_window(app);
     Ok(())
 }
 

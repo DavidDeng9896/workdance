@@ -4,73 +4,121 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WorkDance 设置</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=apple-lumen-nits" />
 </head>
-<body>
-  <header>
-    <h1>WorkDance 设置</h1>
-    <p class="sub">本地配置 · 音视频不离开本机</p>
-  </header>
-
+<body class="skin-apple">
   <div id="visionBanner" class="banner" hidden></div>
   <div id="asrBanner" class="banner" hidden></div>
 
-  <section class="section">
-    <h2>手势</h2>
-    <div class="row">
-      <div class="row-main">
-        <div class="row-title">手势总开关</div>
-        <div class="row-desc">关闭后不移动光标；可与「仅语音」配合</div>
+  <div class="group">
+    <h2 class="group-label">手势</h2>
+    <section class="section">
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">手势总开关</div>
+          <div class="row-desc">开启后托盘显示蓝点，可用手势操控</div>
+        </div>
+        <div class="row-control">
+          <label class="switch"><input id="gestureEnabled" type="checkbox" /><span></span></label>
+        </div>
       </div>
-      <div class="row-control">
-        <label class="switch"><input id="gestureEnabled" type="checkbox" /><span></span></label>
-      </div>
-    </div>
-    <div class="row stack">
-      <div class="row-head">
+      <div class="row">
         <div class="row-main">
           <div class="row-title">灵敏度</div>
+          <div class="row-desc">偏低更稳，偏高更跟手</div>
+        </div>
+        <div class="row-control">
+          <div class="slider-inline">
+            <input id="sensitivity" type="range" min="0" max="100" value="70" />
+          </div>
         </div>
       </div>
-      <div class="slider-wrap">
-        <input id="sensitivity" type="range" min="0" max="100" value="70" />
-        <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
-      </div>
-    </div>
-    <div class="row stack">
-      <div class="row-head">
+      <div class="row">
         <div class="row-main">
-          <div class="row-title">死区</div>
+          <div class="row-title">摄像头</div>
+          <div class="row-desc">性能优先降低延迟</div>
+        </div>
+        <div class="row-control">
+          <div class="seg" id="cameraMode">
+            <button type="button" data-value="performance" class="active">性能</button>
+            <button type="button" data-value="hd">高清</button>
+          </div>
         </div>
       </div>
-      <div class="slider-wrap">
-        <input id="deadZone" type="range" min="0" max="40" value="15" />
-        <div class="slider-labels"><span>更灵敏</span><span>更抗抖</span></div>
-      </div>
-    </div>
-    <div class="row">
-      <div class="row-main">
-        <div class="row-title">摄像头模式</div>
-        <div class="row-desc">性能档优先更低延迟</div>
-      </div>
-      <div class="row-control">
-        <div class="seg" id="cameraMode">
-          <button type="button" data-value="performance" class="active">性能</button>
-          <button type="button" data-value="hd">高清</button>
-        </div>
-      </div>
-    </div>
-  </section>
+    </section>
+  </div>
 
-  <section class="section">
-    <h2>语音</h2>
+  <div class="group">
+    <h2 class="group-label">语音</h2>
+    <section class="section">
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">仅语音兜底</div>
+          <div class="row-desc">关闭手势，保留听写路径</div>
+        </div>
+        <div class="row-control">
+          <label class="switch"><input id="voiceOnly" type="checkbox" /><span></span></label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">听写模型</div>
+          <div class="row-desc">默认 Paraformer-zh-small（sherpa-onnx）；缺模型时禁用假听写</div>
+        </div>
+        <div class="row-control">
+          <div class="seg" id="asrModel">
+            <button type="button" data-value="tiny" class="active">Tiny</button>
+            <button type="button" data-value="base">Base</button>
+          </div>
+        </div>
+      </div>
+      <div class="row stack">
+        <div class="row-main">
+          <div class="row-title">模型安装状态</div>
+          <div class="row-desc" id="asrModelHint">运行 <code>scripts/download-asr-model.sh</code> 下载并校验 SHA256</div>
+        </div>
+        <div id="asrModelState" class="sub" style="margin:0;">检测中…</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="group">
+    <h2 class="group-label">常规</h2>
+    <section class="section">
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">备忘录路径</div>
+          <div class="row-desc">听写草稿落盘位置</div>
+        </div>
+        <div class="row-control path-inline">
+          <input id="notesPath" class="path-text" type="text" readonly tabindex="-1" />
+          <button class="link-btn" id="chooseNotesPath" type="button">选择…</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-main">
+          <div class="row-title">开机自启</div>
+          <div class="row-desc">登录后托盘常驻</div>
+        </div>
+        <div class="row-control">
+          <label class="switch"><input id="launchAtStartup" type="checkbox" /><span></span></label>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Extra config + tray demo: collapsed / hidden from main groups (QA P0). -->
+  <details class="dev-demo">
+    <summary>开发演示</summary>
     <div class="row">
       <div class="row-main">
-        <div class="row-title">仅语音兜底</div>
-        <div class="row-desc">关闭手势光标；托盘「开始听写」武装麦克风听写（无需握拳）</div>
+        <div class="row-title">死区</div>
+        <div class="row-desc">更灵敏 ↔ 更抗抖</div>
       </div>
       <div class="row-control">
-        <label class="switch"><input id="voiceOnly" type="checkbox" /><span></span></label>
+        <div class="slider-inline">
+          <input id="deadZone" type="range" min="0" max="40" value="15" />
+        </div>
       </div>
     </div>
     <div class="row">
@@ -84,79 +132,33 @@
         </div>
       </div>
     </div>
-    <div class="row">
-      <div class="row-main">
-        <div class="row-title">听写模型</div>
-        <div class="row-desc">默认 Paraformer-zh-small（sherpa-onnx）；缺模型时禁用假听写</div>
-      </div>
-      <div class="row-control">
-        <div class="seg" id="asrModel">
-          <button type="button" data-value="tiny" class="active">Tiny</button>
-          <button type="button" data-value="base">Base · 更准</button>
-        </div>
-      </div>
-    </div>
-    <div class="row stack">
-      <div class="row-main">
-        <div class="row-title">模型安装状态</div>
-        <div class="row-desc" id="asrModelHint">运行 <code>scripts/download-asr-model.sh</code> 下载并校验 SHA256</div>
-      </div>
-      <div id="asrModelState" class="sub" style="margin:0;">检测中…</div>
-    </div>
-  </section>
-
-  <section class="section">
-    <h2>常规</h2>
-    <div class="row stack">
-      <div class="row-main">
-        <div class="row-title">备忘录路径</div>
-        <div class="row-desc">G08 听写草稿落盘位置（仅 Markdown，不存音频）</div>
-      </div>
-      <div class="path-field">
-        <input id="notesPath" type="text" />
-      </div>
-    </div>
     <div class="row stack">
       <div class="row-main">
         <div class="row-title">备忘搜索</div>
         <div class="row-desc">按标题/正文子串过滤本地 MD</div>
       </div>
-      <div class="path-field" style="display:flex;gap:8px;align-items:center;">
-        <input id="notesQuery" type="text" placeholder="关键词…" style="flex:1;" />
+      <div class="path-field">
+        <input id="notesQuery" type="text" placeholder="关键词…" />
         <button class="btn btn-sm" id="searchNotes" type="button">搜索</button>
       </div>
-      <pre id="notesHits" class="sub" style="margin:8px 0 0;white-space:pre-wrap;max-height:120px;overflow:auto;"></pre>
+      <pre id="notesHits" class="sub notes-hits"></pre>
     </div>
-    <div class="row">
-      <div class="row-main">
-        <div class="row-title">开机自启</div>
-        <div class="row-desc">登录后驻留系统托盘</div>
-      </div>
-      <div class="row-control">
-        <label class="switch"><input id="launchAtStartup" type="checkbox" /><span></span></label>
-      </div>
-    </div>
-  </section>
-
-  <!-- Dev-only tray state demo; collapsed by default (Lumen QA). -->
-  <details class="dev-demo">
-    <summary>开发演示</summary>
     <div class="row">
       <div id="modePill" class="mode-pill"><span class="dot"></span><span id="modeLabel">休眠</span></div>
-      <div style="display:flex;gap:8px;">
+      <div class="dev-actions">
         <button class="btn btn-sm" id="cycleMode" type="button">手动切换</button>
         <button class="btn btn-sm" id="autoMode" type="button">恢复自动</button>
       </div>
     </div>
-    <p class="sub" style="margin:0 0 10px;">休眠与手势开默认由视觉状态机驱动；录音仍可手动切换。</p>
+    <p class="sub">休眠与手势开默认由视觉状态机驱动；录音仍可手动切换。</p>
   </details>
 
   <div class="footer space-between">
-    <button class="btn btn-ghost" id="openPermissions" type="button">权限</button>
-    <div style="display:flex;gap:10px;">
-      <button class="btn" id="openCalibration" type="button">校准</button>
-      <button class="btn btn-primary" id="save" type="button">保存</button>
+    <div class="footer-links">
+      <button class="link-btn" id="openPermissions" type="button">权限</button>
+      <button class="link-btn" id="openCalibration" type="button">校准</button>
     </div>
+    <button class="btn btn-primary" id="save" type="button">存储</button>
   </div>
 
   <script src="common.js"></script>
@@ -217,7 +219,8 @@
       const min = Number(el.min) || 0;
       const max = Number(el.max) || 100;
       const pct = ((Number(el.value) - min) / (max - min)) * 100;
-      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, #2a3340 ${pct}%)`;
+      const track = getComputedStyle(document.body).getPropertyValue("--slider-track").trim() || "#2a3340";
+      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, ${track} ${pct}%)`;
       el.style.backgroundSize = "100% 3px";
       el.style.backgroundRepeat = "no-repeat";
       el.style.backgroundPosition = "center";
@@ -242,6 +245,15 @@
         document.getElementById("voiceOnly").checked = false;
       }
     });
+
+    document.getElementById("chooseNotesPath").onclick = () => {
+      const input = document.getElementById("notesPath");
+      const next = window.prompt("备忘录路径", input.value || "~/Documents/WorkDance");
+      if (next !== null && next.trim()) {
+        input.value = next.trim();
+        state.notes_path = input.value;
+      }
+    };
 
     document.getElementById("save").onclick = async () => {
       try {

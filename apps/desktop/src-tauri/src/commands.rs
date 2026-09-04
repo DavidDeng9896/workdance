@@ -62,10 +62,16 @@ pub fn save_settings(
 
 #[tauri::command]
 pub fn get_mode(state: State<'_, AppState>) -> ModeView {
+    mode_view_from_state(&state)
+}
+
+fn mode_view_from_state(state: &State<'_, AppState>) -> ModeView {
     let rt = state.runtime.lock();
     let voice_only = state.config.lock().voice_only;
     let tray_title_zh = if voice_only {
         rt.mode.tray_title_voice_only()
+    } else if rt.mode == AppMode::Recording {
+        format!("WorkDance · 录音 · {}s", rt.recording_seconds)
     } else {
         rt.mode.tray_title_zh()
     };
@@ -247,6 +253,8 @@ fn mode_view(app: &AppHandle) -> ModeView {
     let voice_only = state.config.lock().voice_only;
     let tray_title_zh = if voice_only {
         rt.mode.tray_title_voice_only()
+    } else if rt.mode == AppMode::Recording {
+        format!("WorkDance · 录音 · {}s", rt.recording_seconds)
     } else {
         rt.mode.tray_title_zh()
     };

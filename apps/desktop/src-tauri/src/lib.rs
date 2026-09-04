@@ -77,9 +77,10 @@ pub fn run() {
                 "calibration",
                 "WorkDance 校准",
                 "calibration.html",
-                900.0,
-                640.0,
+                960.0,
+                720.0,
             )?;
+            ensure_pip_window(app.handle())?;
 
             // Input always starts (voice-only listen needs it); vision is gated.
             *app.state::<AppState>().input.lock() =
@@ -131,9 +132,53 @@ fn ensure_window(
     Ok(())
 }
 
+/// Continuity PiP (~180×120): gesture-active / recording chrome only.
+fn ensure_pip_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("pip").is_some() {
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, "pip", WebviewUrl::App("pip.html".into()))
+        .title("WorkDance Continuity")
+        .inner_size(180.0, 120.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()?;
+    Ok(())
+}
+
 pub fn show_window(app: &tauri::AppHandle, label: &str) {
     if let Some(w) = app.get_webview_window(label) {
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+/// Show Continuity PiP for gesture/recording; hide on sleep. UI-only chrome.
+pub fn sync_pip_window(app: &tauri::AppHandle) {
+    let mode = app.state::<AppState>().runtime.lock().mode;
+    let Some(w) = app.get_webview_window("pip") else {
+        return;
+    };
+    match mode {
+        workdance_core::AppMode::Sleep => {
+            let _ = w.hide();
+        }
+        workdance_core::AppMode::GestureActive | workdance_core::AppMode::Recording => {
+            // Bottom-right-ish; best-effort (multi-monitor ignored).
+            if let Ok(Some(m)) = app.primary_monitor() {
+                let size = m.size();
+                let scale = m.scale_factor();
+                let w_px = (180.0 * scale) as i32;
+                let h_px = (120.0 * scale) as i32;
+                let margin = (28.0 * scale) as i32;
+                let x = size.width as i32 - w_px - margin;
+                let y = size.height as i32 - h_px - margin - (40.0 * scale) as i32;
+                let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
+            }
+            let _ = w.show();
+        }
     }
 }
