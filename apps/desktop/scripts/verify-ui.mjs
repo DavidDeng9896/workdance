@@ -10,6 +10,8 @@ const required = [
   "settings.html",
   "permissions.html",
   "calibration.html",
+  "pip.html",
+  "live.html",
   "common.js",
 ];
 
