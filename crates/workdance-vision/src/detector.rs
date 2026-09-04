@@ -184,7 +184,8 @@ impl HandPresenceDetector for OrtHandLandmarker {
         if mean > 12 {
             let mut hand = HandFrame::presence_only(true, 0.65);
             if detail == DetectDetail::FullLandmarks {
-                // Landmarks intentionally empty until a real ORT graph is wired (WP-M2).
+                // Landmarks intentionally empty until a real ORT graph fills them; WP-M2 maps
+                // landmarks when present, otherwise the input bridge keeps the stub path.
                 hand.landmarks = None;
             }
             hand

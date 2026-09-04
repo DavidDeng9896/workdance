@@ -4,7 +4,7 @@
 
 - 锁定规格：[docs/specs/2026-09-04-workdance-locked.md](docs/specs/2026-09-04-workdance-locked.md)
 - 集成计划：[docs/specs/2026-09-04-mediapipe-asr-plan.md](docs/specs/2026-09-04-mediapipe-asr-plan.md)
-- 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands 后端骨架）**
+- 当前实现：**WP0–WP5（v1 壳）+ WP-M1（MediaPipe Hands）+ WP-M2（landmark→G02–G05）**
 
 ## 架构
 
@@ -85,7 +85,7 @@ cd apps/desktop && npm install && npm run tauri -- dev
 - Sleep 档：`PresenceOnly`（无 landmarks）；Active 档：`FullLandmarks`（有则填 21 点）。前置摄像头推理前水平镜像
 - 模型：`hand_landmarker.task` → `dirs::data_local_dir()/workdance/models/`（**不进 git**）
 - `create_default_detector()` 优先级：mediapipe 模型在盘 → `ort-hands` → stub；缺模型 / 打开失败 → stub + **明确** `VisionBackendStatus`（设置页 banner / `get_vision_status`），禁止静默假检测
-- 手势 landmarks **尚未**接入 G02–G05（WP-M2）；ASR / sherpa 不在本切片（WP-A1）
+- 手势 landmarks **已**接入 G02–G05（见下方 WP-M2）；ASR / sherpa 不在本切片（WP-A1）
 
 ### 下载模型
 
@@ -119,9 +119,30 @@ cargo check -p workdance-vision --features mediapipe-hands
 
 Linux CI 默认 **stub 绿**（`WORKDANCE_VISION_STUB=1`）；另有 `cargo check --features mediapipe-hands`（无需本机 lib）。
 
+## WP-M2：landmark → G02–G05
+
+有 21 点 landmarks（MediaPipe Active / 测试 fixture）时，替换纯 stub 轨迹：
+
+| 手势 | 映射 |
+| --- | --- |
+| **G02** | 食指尖（landmark 8）→ 既有平滑 / 死区 / 校准 → 屏幕光标（引擎内镜像 X） |
+| **G03 / G04** | 四指 tip–MCP / PIP–MCP 曲率 → `openness` → 短拳单击 / 长拳滚动 |
+| **G05** | 掌心（腕 + 四 MCP 均值）下挥 → Esc |
+
+- **Sleep**：仍不注入光标（开局无误触）；`DualTierMachine` 阈值未改
+- **无 landmarks**（stub presence-only）：保留原先脚本化 `HandSample` 路径，CI 绿
+- `InjectQueue` 串行不变；Win/Mac 真注入，Linux `NullInjector`
+- 单测：`workdance-input` `landmarks` 合成序列覆盖 move / click / scroll / swipe + Sleep 抑制
+
+```bash
+cargo test -p workdance-input --lib landmarks
+WORKDANCE_VISION_STUB=1 cargo test -p workdance-vision
+```
+
 ## OUT OF SCOPE
 
 - 云同步、术语热词、Word/仪器适配、合并本 PR 之外的发行流程
+- **WP-A1** sherpa ASR（本切片不做）
 
 ## Linux CI 依赖
 

@@ -107,7 +107,7 @@
 | 切片 | 内容 | 完成判据 |
 | --- | --- | --- |
 | **WP-M1** | `mediapipe-hands` feature + `HandPresenceDetector` 实现；缺模型显式降级 | 真机掌入镜唤醒 DualTier；CI 仍 stub 绿 |
-| **WP-M2** | 下载脚本 + sha256；设置/托盘「视觉模型」状态；`ort-hands` 回退文档化 | 无模型有 UI；有模型可一键就绪 |
+| **WP-M2** | landmark → G02–G05：食指尖光标 / 曲率握拳 / 掌心下挥；无 landmarks 保留 stub | 合成 landmark 单测绿；Sleep 不注入；CI stub 路径不变 |
 | **WP-A1** | sherpa-onnx SenseVoice **或** Paraformer-zh INT8 实现 `AsrBackend` | 内存 PCM → 中文文本；无 wav、无上传 |
 | **WP-A2** | 缺 ASR 模型 UI；禁用假听写；whisper 作可选备份 feature | 生产不默认 StubAsr；CI 仍可用 Stub |
 | **WP-P** | 端到端打磨：线程边界、失败文案、Win/Mac 验收、README | 拔网线可手势 + 听写；与锁定规格验收对齐 |

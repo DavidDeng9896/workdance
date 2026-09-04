@@ -37,10 +37,11 @@ pub struct HandLandmark {
     pub z: f32,
 }
 
-/// Extended hand observation for MediaPipe / landmarker backends (WP-M1).
+/// Extended hand observation for MediaPipe / landmarker backends (WP-M1 / WP-M2).
 ///
 /// DualTierMachine still consumes [`PalmObservation`]; convert via [`HandFrame::as_palm`]
-/// / [`From`]. Landmarks are optional and **not** wired into G02–G05 yet (WP-M2).
+/// / [`From`]. When `landmarks` is `Some` (21 points), `workdance-input` maps them to
+/// G02–G05 via index tip / finger curl / palm center (WP-M2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HandFrame {
     pub present: bool,

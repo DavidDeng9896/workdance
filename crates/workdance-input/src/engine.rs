@@ -19,12 +19,18 @@ const SWIPE_DOWN_DY: f32 = 0.22;
 const MIN_DELTA: f32 = 0.004;
 
 /// One hand sample in normalized camera/selfie space (x,y in 0..1).
+///
+/// `x`/`y` track the **index fingertip** (G02 cursor). `palm_x`/`palm_y` track
+/// palm-center motion for G05 swipe. Stub helpers set palm == tip.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HandSample {
     pub present: bool,
     pub confidence: f32,
     pub x: f32,
     pub y: f32,
+    /// Palm center (WP-M2 landmarks); equals `x`/`y` for stub samples.
+    pub palm_x: f32,
+    pub palm_y: f32,
     /// 0.0 = fist, 1.0 = open palm.
     pub openness: f32,
 }
@@ -36,6 +42,8 @@ impl HandSample {
             confidence: 0.95,
             x,
             y,
+            palm_x: x,
+            palm_y: y,
             openness: 0.95,
         }
     }
@@ -46,6 +54,8 @@ impl HandSample {
             confidence: 0.95,
             x,
             y,
+            palm_x: x,
+            palm_y: y,
             openness: 0.1,
         }
     }
@@ -56,6 +66,8 @@ impl HandSample {
             confidence: 0.0,
             x: 0.0,
             y: 0.0,
+            palm_x: 0.0,
+            palm_y: 0.0,
             openness: 0.0,
         }
     }
@@ -304,9 +316,9 @@ impl GestureEngine {
         self.last_screen = Some(screen);
         self.update_focus_hover(now_ms, screen);
 
-        // Keep raw previous for swipe (smoothing would shrink fast flicks).
+        // Keep raw previous palm for G05 swipe (smoothing would shrink fast flicks).
         let raw_prev = self.last_raw;
-        self.last_raw = Some((sample.x, sample.y));
+        self.last_raw = Some((sample.palm_x, sample.palm_y));
 
         // --- Fist state machine (G03 / G04 / G08 double short-fist) ---
         // Heuristic: two short-fist releases (<SHORT_FIST_MAX) within G08_WINDOW_MS
@@ -393,8 +405,8 @@ impl GestureEngine {
                 }
             } else if moving {
                 if let Some((rx0, ry0)) = raw_prev {
-                    let raw_dy = sample.y - ry0;
-                    let raw_dx = sample.x - rx0;
+                    let raw_dy = sample.palm_y - ry0;
+                    let raw_dx = sample.palm_x - rx0;
                     if self.swipe_armed && raw_dy >= SWIPE_DOWN_DY && raw_dx.abs() < 0.12 {
                         out.commands.push(InjectCommand::KeyEscape);
                         self.swipe_armed = false;
@@ -414,7 +426,7 @@ impl GestureEngine {
             }
         }
 
-        if sample.is_open_palm() && !self.swipe_armed && sample.y < 0.35 {
+        if sample.is_open_palm() && !self.swipe_armed && sample.palm_y < 0.35 {
             self.swipe_armed = true;
         }
 
