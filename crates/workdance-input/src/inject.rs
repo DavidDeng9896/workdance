@@ -302,6 +302,10 @@ mod windows {
                     });
                 }
             }
+            InjectCommand::AppendText { text } => {
+                // AX/UIA SetValue unavailable in WP3 path A → Unicode keyboard fallback.
+                return unicode_type_text(text);
+            }
         }
 
         if inputs.is_empty() {
@@ -315,6 +319,71 @@ mod windows {
         if n as usize != inputs.len() {
             return Err(InjectError::Backend(format!(
                 "SendInput returned {n}/{}",
+                inputs.len()
+            )));
+        }
+        Ok(())
+    }
+
+    unsafe fn unicode_type_text(text: &str) -> Result<(), InjectError> {
+        use std::mem::size_of;
+
+        #[repr(C)]
+        struct INPUT {
+            type_: u32,
+            union_: INPUTUNION,
+        }
+        #[repr(C)]
+        union INPUTUNION {
+            ki: KEYBDINPUT,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct KEYBDINPUT {
+            wVk: u16,
+            wScan: u16,
+            dwFlags: u32,
+            time: u32,
+            dwExtraInfo: usize,
+        }
+
+        const INPUT_KEYBOARD: u32 = 1;
+        const KEYEVENTF_KEYUP: u32 = 0x0002;
+        const KEYEVENTF_UNICODE: u32 = 0x0004;
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn SendInput(cInputs: u32, pInputs: *mut INPUT, cbSize: i32) -> u32;
+        }
+
+        let mut inputs: Vec<INPUT> = Vec::new();
+        for ch in text.encode_utf16() {
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                inputs.push(INPUT {
+                    type_: INPUT_KEYBOARD,
+                    union_: INPUTUNION {
+                        ki: KEYBDINPUT {
+                            wVk: 0,
+                            wScan: ch,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let n = SendInput(
+            inputs.len() as u32,
+            inputs.as_mut_ptr(),
+            size_of::<INPUT>() as i32,
+        );
+        if n as usize != inputs.len() {
+            return Err(InjectError::Backend(format!(
+                "SendInput unicode returned {n}/{}",
                 inputs.len()
             )));
         }
@@ -472,7 +541,47 @@ mod macos {
                 }
                 Ok(())
             }
+            InjectCommand::AppendText { text } => {
+                // AX SetValue unavailable → Unicode keyboard inject fallback.
+                unicode_type_text(text)
+            }
         }
+    }
+
+    unsafe fn unicode_type_text(text: &str) -> Result<(), InjectError> {
+        type CGEventRef = *mut std::ffi::c_void;
+        type CGEventSourceRef = *mut std::ffi::c_void;
+        type CGKeyCode = u16;
+        type UniChar = u16;
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventCreateKeyboardEvent(
+                source: CGEventSourceRef,
+                virtualKey: CGKeyCode,
+                keyDown: bool,
+            ) -> CGEventRef;
+            fn CGEventKeyboardSetUnicodeString(
+                event: CGEventRef,
+                length: usize,
+                string: *const UniChar,
+            );
+            fn CGEventPost(tap: u32, event: CGEventRef);
+            fn CFRelease(cf: *mut std::ffi::c_void);
+        }
+        const K_CG_HID_EVENT_TAP: u32 = 0;
+
+        let utf16: Vec<UniChar> = text.encode_utf16().collect();
+        for down in [true, false] {
+            let ev = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, down);
+            if ev.is_null() {
+                return Err(InjectError::Backend("null CGEvent unicode".into()));
+            }
+            CGEventKeyboardSetUnicodeString(ev, utf16.len(), utf16.as_ptr());
+            CGEventPost(K_CG_HID_EVENT_TAP, ev);
+            CFRelease(ev);
+        }
+        Ok(())
     }
 }
 
@@ -503,11 +612,36 @@ mod tests {
         }));
         q.enqueue(InjectCommand::ClickLeft).unwrap();
         q.enqueue(InjectCommand::KeyEscape).unwrap();
+        q.enqueue(InjectCommand::AppendText {
+            text: "实验".into(),
+        })
+        .unwrap();
         q.stop();
         let got = log.lock().unwrap().clone();
         assert_eq!(
             got,
-            vec![InjectCommand::ClickLeft, InjectCommand::KeyEscape]
+            vec![
+                InjectCommand::ClickLeft,
+                InjectCommand::KeyEscape,
+                InjectCommand::AppendText {
+                    text: "实验".into()
+                }
+            ]
         );
+    }
+
+    #[test]
+    fn null_injector_accepts_append_without_files() {
+        let tmp = std::env::temp_dir().join("workdance-inject-append-probe");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let before: Vec<_> = std::fs::read_dir(&tmp).unwrap().collect();
+        let mut inj = NullInjector;
+        inj.execute(&InjectCommand::AppendText {
+            text: "实验记录已追加。".into(),
+        })
+        .unwrap();
+        let after: Vec<_> = std::fs::read_dir(&tmp).unwrap().collect();
+        assert_eq!(before.len(), after.len());
     }
 }

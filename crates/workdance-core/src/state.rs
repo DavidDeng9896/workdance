@@ -10,7 +10,7 @@ pub enum AppMode {
     Sleep,
     /// Gesture active — virtual cursor later (WP2).
     GestureActive,
-    /// Recording — G07 long-hold later (WP3).
+    /// Recording — G07 long-hold dictation (WP3).
     Recording,
 }
 

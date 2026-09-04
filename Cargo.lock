@@ -5353,6 +5353,7 @@ dependencies = [
 name = "workdance-input"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "parking_lot",
  "serde",
  "thiserror 2.0.20",

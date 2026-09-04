@@ -1,4 +1,4 @@
-//! Bridges vision tier → gesture engine → serial inject queue.
+//! Bridges vision tier → gesture engine → serial inject queue + G07 tray Recording.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -6,10 +6,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use workdance_core::{load_config, VisionTier};
+use tauri::{AppHandle, Manager};
+use workdance_core::{load_config, AppMode, VisionTier};
 use workdance_input::{
-    create_default_injector, GestureEngine, HandSample, InjectQueue,
+    create_default_injector, G07Event, GestureEngine, HandSample, InjectQueue,
 };
+
+use crate::{tray, AppState};
 
 /// Shared tier flag updated from vision_bridge.
 pub struct InputBridge {
@@ -20,7 +23,7 @@ pub struct InputBridge {
 }
 
 impl InputBridge {
-    pub fn start() -> Self {
+    pub fn start(app: AppHandle) -> Self {
         let cfg = load_config().unwrap_or_default();
         let tier = Arc::new(Mutex::new(VisionTier::Sleep));
         let stop = Arc::new(AtomicBool::new(false));
@@ -35,12 +38,18 @@ impl InputBridge {
 
         let tier_feed = tier.clone();
         let stop_flag = stop.clone();
-        // Move queue into thread via channel-less ownership: recreate sender side —
-        // InjectQueue isn't Clone; run engine loop with owned queue.
         let handle = thread::Builder::new()
             .name("workdance-gesture".into())
             .spawn(move || {
-                gesture_loop(cfg.sensitivity, cfg.dead_zone, force_stub, tier_feed, stop_flag, queue);
+                gesture_loop(
+                    app,
+                    cfg.sensitivity,
+                    cfg.dead_zone,
+                    force_stub,
+                    tier_feed,
+                    stop_flag,
+                    queue,
+                );
             })
             .expect("spawn gesture thread");
 
@@ -55,6 +64,10 @@ impl InputBridge {
     pub fn set_tier(&self, tier: VisionTier) {
         *self.tier.lock() = tier;
     }
+
+    pub fn current_tier(&self) -> VisionTier {
+        *self.tier.lock()
+    }
 }
 
 impl Drop for InputBridge {
@@ -67,6 +80,7 @@ impl Drop for InputBridge {
 }
 
 fn gesture_loop(
+    app: AppHandle,
     sensitivity: f32,
     dead_zone: f32,
     force_stub: bool,
@@ -78,7 +92,7 @@ fn gesture_loop(
     let start = Instant::now();
     let mut last_tier = VisionTier::Sleep;
     eprintln!(
-        "[workdance-input] gesture loop stub_samples={}",
+        "[workdance-input] gesture loop stub_samples={} (WP3 G07 enabled)",
         force_stub
     );
 
@@ -92,28 +106,68 @@ fn gesture_loop(
         if t == VisionTier::Active && force_stub {
             let ms = start.elapsed().as_millis() as u64;
             // Looping stub choreography for demo without landmarks.
-            let sample = stub_sample(ms % 6000);
-            let cmds = engine.on_sample(ms, sample);
-            let _ = queue.enqueue_all(cmds);
+            let sample = stub_sample(ms % 9000);
+            let tick = engine.on_sample(ms, sample);
+            apply_g07_tray(&app, &tier, &tick.g07_events);
+            let _ = queue.enqueue_all(tick.commands);
             thread::sleep(Duration::from_millis(32)); // ~30 FPS active
         } else {
             // Sleep tier or no stub: do not invent motion (开局无误触).
+            // Still tick absence into engine if leaving Active mid-record.
+            if engine.is_recording() {
+                let ms = start.elapsed().as_millis() as u64;
+                let tick = engine.on_sample(ms, HandSample::absent());
+                apply_g07_tray(&app, &tier, &tick.g07_events);
+                let _ = queue.enqueue_all(tick.commands);
+            }
             thread::sleep(Duration::from_millis(50));
         }
     }
     queue.stop();
 }
 
-/// Deterministic open-palm / fist / swipe script for CI & stub demos.
+fn apply_g07_tray(app: &AppHandle, tier: &Arc<Mutex<VisionTier>>, events: &[G07Event]) {
+    for ev in events {
+        match ev {
+            G07Event::RecordingStarted => {
+                let state = app.state::<AppState>();
+                {
+                    let mut rt = state.runtime.lock();
+                    if !rt.manual_override {
+                        rt.mode = AppMode::Recording;
+                        rt.recording_seconds = 0;
+                    }
+                }
+                let _ = tray::refresh_tray(app);
+            }
+            G07Event::RecordingAborted | G07Event::DictationReady { .. } => {
+                let state = app.state::<AppState>();
+                {
+                    let mut rt = state.runtime.lock();
+                    if !rt.manual_override && rt.mode == AppMode::Recording {
+                        rt.mode = AppMode::from_vision_tier(*tier.lock());
+                        rt.recording_seconds = 0;
+                    }
+                }
+                let _ = tray::refresh_tray(app);
+            }
+        }
+    }
+}
+
+/// Deterministic open-palm / fist / swipe / G07 script for CI & stub demos.
 fn stub_sample(ms: u64) -> HandSample {
     // 0–800: open palm drift (G02)
     // 800–1000: short fist → click (G03)
     // 1000–1400: open again
-    // 1400–2000: long fist hold
+    // 1400–2000: long fist hold (G04 arm)
     // 2000–2600: fist scroll down (G04)
     // 2600–3200: open at top
     // 3200–3600: swipe down (G05)
-    // 3600–6000: idle open
+    // 3600–4000: open settle
+    // 4000–5200: fist hold ≥1s → G07 record
+    // 5200–5600: release → stub ASR append
+    // 5600–9000: idle open
     if ms < 800 {
         let t = ms as f32 / 800.0;
         HandSample::open_palm(0.35 + t * 0.25, 0.45)
@@ -130,6 +184,12 @@ fn stub_sample(ms: u64) -> HandSample {
         HandSample::open_palm(0.5, 0.2)
     } else if ms < 3600 {
         HandSample::open_palm(0.5, 0.55)
+    } else if ms < 4000 {
+        HandSample::open_palm(0.5, 0.5)
+    } else if ms < 5200 {
+        HandSample::fist(0.5, 0.5)
+    } else if ms < 5600 {
+        HandSample::open_palm(0.5, 0.5)
     } else {
         HandSample::open_palm(0.5, 0.5)
     }

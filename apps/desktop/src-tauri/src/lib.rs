@@ -1,4 +1,4 @@
-//! WorkDance desktop shell (WP0–WP2). No ASR / memo (WP3+).
+//! WorkDance desktop shell (WP0–WP3). G08 memo / full settings polish later.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -70,7 +70,8 @@ pub fn run() {
                 640.0,
             )?;
 
-            *app.state::<AppState>().input.lock() = Some(InputBridge::start());
+            *app.state::<AppState>().input.lock() =
+                Some(InputBridge::start(app.handle().clone()));
             vision_bridge::start_vision_worker(app.handle())?;
 
             if show_first_run {

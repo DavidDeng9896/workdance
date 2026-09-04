@@ -1,5 +1,9 @@
 use workdance_core::VisionTier;
 
+use crate::asr::{create_default_asr, AsrBackend};
+use crate::focus::{create_default_focus_probe, FocusLock, FocusProbe};
+use crate::g07::{G07Event, G07Machine};
+
 /// Max fist hold that still counts as G03 click.
 pub const SHORT_FIST_MAX: u64 = 300;
 
@@ -70,6 +74,8 @@ pub enum InjectCommand {
     ClickLeft,
     Scroll { dy: i32 },
     KeyEscape,
+    /// Append Unicode text into the locked focus (WP3 G07).
+    AppendText { text: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +87,13 @@ enum FistPhase {
     LongHold,
 }
 
+/// Result of one engine tick (inject intents + G07 tray signals).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct EngineTick {
+    pub commands: Vec<InjectCommand>,
+    pub g07_events: Vec<G07Event>,
+}
+
 /// Maps hand samples + vision tier → inject intents (no OS calls).
 pub struct GestureEngine {
     screen_w: i32,
@@ -90,10 +103,15 @@ pub struct GestureEngine {
     tier: VisionTier,
     last_pos: Option<(f32, f32)>,
     last_raw: Option<(f32, f32)>,
+    last_screen: Option<(i32, i32)>,
     smooth_x: crate::smoother::ExpSmoother,
     smooth_y: crate::smoother::ExpSmoother,
     fist: FistPhase,
     swipe_armed: bool,
+    focus: FocusLock,
+    probe: Box<dyn FocusProbe>,
+    g07: G07Machine,
+    asr: Box<dyn AsrBackend>,
 }
 
 impl GestureEngine {
@@ -107,11 +125,34 @@ impl GestureEngine {
             tier: VisionTier::Sleep,
             last_pos: None,
             last_raw: None,
+            last_screen: None,
             smooth_x: crate::smoother::ExpSmoother::new(alpha),
             smooth_y: crate::smoother::ExpSmoother::new(alpha),
             fist: FistPhase::Idle,
             swipe_armed: true,
+            focus: FocusLock::new(),
+            probe: create_default_focus_probe(),
+            g07: G07Machine::new(),
+            asr: create_default_asr(),
         }
+    }
+
+    pub fn with_probe(mut self, probe: Box<dyn FocusProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    pub fn with_asr(mut self, asr: Box<dyn AsrBackend>) -> Self {
+        self.asr = asr;
+        self
+    }
+
+    pub fn focus_lock(&self) -> &FocusLock {
+        &self.focus
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.g07.is_recording()
     }
 
     pub fn set_tier(&mut self, tier: VisionTier) {
@@ -128,20 +169,71 @@ impl GestureEngine {
         self.smooth_y.reset();
         self.fist = FistPhase::Idle;
         self.swipe_armed = true;
+        // Focus lock intentionally kept across gesture move / brief absence.
     }
 
-    pub fn on_sample(&mut self, now_ms: u64, sample: HandSample) -> Vec<InjectCommand> {
-        if self.tier != VisionTier::Active {
-            return Vec::new();
+    fn screen_from_norm(&self, sx: f32, sy: f32) -> (i32, i32) {
+        let screen_x = (sx * self.screen_w as f32)
+            .clamp(0.0, (self.screen_w - 1) as f32)
+            .round() as i32;
+        // Mirror X for selfie front camera.
+        let screen_x = self.screen_w - 1 - screen_x;
+        let screen_y = (sy * self.screen_h as f32)
+            .clamp(0.0, (self.screen_h - 1) as f32)
+            .round() as i32;
+        (screen_x, screen_y)
+    }
+
+    fn update_focus_hover(&mut self, now_ms: u64, screen: (i32, i32)) {
+        let hit = self.probe.hit_test(screen.0, screen.1);
+        self.focus.on_hover(now_ms, hit);
+    }
+
+    fn apply_g07(
+        &mut self,
+        now_ms: u64,
+        present: bool,
+        fist: bool,
+        out: &mut EngineTick,
+    ) {
+        let events = self.g07.on_sample(now_ms, present, fist, self.asr.as_mut());
+        for ev in events {
+            match &ev {
+                G07Event::DictationReady { text } => {
+                    out.commands.push(InjectCommand::AppendText {
+                        text: text.clone(),
+                    });
+                }
+                G07Event::RecordingStarted | G07Event::RecordingAborted => {}
+            }
+            out.g07_events.push(ev);
         }
+    }
+
+    pub fn on_sample(&mut self, now_ms: u64, sample: HandSample) -> EngineTick {
+        let mut out = EngineTick::default();
+
+        if self.tier != VisionTier::Active {
+            // If we somehow leave Active while armed/recording, abort capture.
+            if self.g07.is_recording()
+                || matches!(self.g07.phase(), crate::g07::G07Phase::Arming { .. })
+            {
+                self.apply_g07(now_ms, false, false, &mut out);
+            }
+            return out;
+        }
+
         if !sample.present || sample.confidence < workdance_core::MIN_PALM_CONFIDENCE {
+            self.apply_g07(now_ms, false, false, &mut out);
             self.reset_motion();
-            return Vec::new();
+            return out;
         }
 
         let sx = self.smooth_x.push(sample.x);
         let sy = self.smooth_y.push(sample.y);
-        let mut out = Vec::new();
+        let screen = self.screen_from_norm(sx, sy);
+        self.last_screen = Some(screen);
+        self.update_focus_hover(now_ms, screen);
 
         // Keep raw previous for swipe (smoothing would shrink fast flicks).
         let raw_prev = self.last_raw;
@@ -152,6 +244,8 @@ impl GestureEngine {
             FistPhase::Idle => {
                 if sample.is_fist() {
                     self.fist = FistPhase::Holding { since_ms: now_ms };
+                    // Fist reconfirm of pending / locked focus target.
+                    self.focus.reconfirm();
                 }
             }
             FistPhase::Holding { since_ms } => {
@@ -162,7 +256,7 @@ impl GestureEngine {
                 } else if sample.is_open_palm() {
                     let held = now_ms.saturating_sub(since_ms);
                     if held < SHORT_FIST_MAX {
-                        out.push(InjectCommand::ClickLeft);
+                        out.commands.push(InjectCommand::ClickLeft);
                     }
                     self.fist = FistPhase::Idle;
                 } else {
@@ -176,7 +270,12 @@ impl GestureEngine {
             }
         }
 
+        // G07: long fist ≥1s → record; leave/release handled inside machine.
+        self.apply_g07(now_ms, true, sample.is_fist(), &mut out);
+        let recording = self.g07.is_recording();
+
         // --- Motion: G02 move vs G04 scroll vs G05 swipe ---
+        // Spec: gesture move does not unlock focus or interrupt voice.
         if let Some((px, py)) = self.last_pos {
             let mut dx = sx - px;
             let mut dy = sy - py;
@@ -187,14 +286,16 @@ impl GestureEngine {
                 dy = 0.0;
             }
 
-            let scrolling = matches!(self.fist, FistPhase::LongHold) && sample.is_fist();
+            let scrolling = matches!(self.fist, FistPhase::LongHold)
+                && sample.is_fist()
+                && !recording;
             let moving = sample.is_open_palm() && matches!(self.fist, FistPhase::Idle);
 
             if scrolling {
                 if dy.abs() >= MIN_DELTA {
                     let scroll = (dy * 800.0 * self.sensitivity).round() as i32;
                     if scroll != 0 {
-                        out.push(InjectCommand::Scroll { dy: scroll });
+                        out.commands.push(InjectCommand::Scroll { dy: scroll });
                     }
                 }
             } else if moving {
@@ -202,24 +303,19 @@ impl GestureEngine {
                     let raw_dy = sample.y - ry0;
                     let raw_dx = sample.x - rx0;
                     if self.swipe_armed && raw_dy >= SWIPE_DOWN_DY && raw_dx.abs() < 0.12 {
-                        out.push(InjectCommand::KeyEscape);
+                        out.commands.push(InjectCommand::KeyEscape);
                         self.swipe_armed = false;
                     }
                 }
-                if !out.iter().any(|c| matches!(c, InjectCommand::KeyEscape))
+                if !out
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, InjectCommand::KeyEscape))
                     && (dx.abs() >= MIN_DELTA || dy.abs() >= MIN_DELTA)
                 {
-                    let screen_x = (sx * self.screen_w as f32)
-                        .clamp(0.0, (self.screen_w - 1) as f32)
-                        .round() as i32;
-                    // Mirror X for selfie front camera.
-                    let screen_x = self.screen_w - 1 - screen_x;
-                    let screen_y = (sy * self.screen_h as f32)
-                        .clamp(0.0, (self.screen_h - 1) as f32)
-                        .round() as i32;
-                    out.push(InjectCommand::MoveAbs {
-                        x: screen_x,
-                        y: screen_y,
+                    out.commands.push(InjectCommand::MoveAbs {
+                        x: screen.0,
+                        y: screen.1,
                     });
                 }
             }
@@ -237,6 +333,9 @@ impl GestureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::StubAsr;
+    use crate::focus::FocusTarget;
+    use crate::g07::G07Event;
 
     fn engine() -> GestureEngine {
         GestureEngine::new(1920, 1080, 0.7, 0.02)
@@ -250,8 +349,11 @@ mod tests {
         let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
         let out = e.on_sample(200, HandSample::open_palm(0.5, 0.5));
         assert!(
-            out.iter().any(|c| matches!(c, InjectCommand::ClickLeft)),
-            "expected ClickLeft for short fist, got {out:?}"
+            out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::ClickLeft)),
+            "expected ClickLeft for short fist, got {:?}",
+            out.commands
         );
     }
 
@@ -262,11 +364,17 @@ mod tests {
         let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
         let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
         let mid = e.on_sample(400, HandSample::fist(0.5, 0.5));
-        assert!(!mid.iter().any(|c| matches!(c, InjectCommand::ClickLeft)));
+        assert!(!mid
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::ClickLeft)));
         let out = e.on_sample(450, HandSample::open_palm(0.5, 0.5));
         assert!(
-            !out.iter().any(|c| matches!(c, InjectCommand::ClickLeft)),
-            "long fist must not click, got {out:?}"
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::ClickLeft)),
+            "long fist must not click, got {:?}",
+            out.commands
         );
     }
 
@@ -275,10 +383,18 @@ mod tests {
         let mut e = engine();
         e.set_tier(VisionTier::Sleep);
         let out = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
-        assert!(out.is_empty(), "sleep must not move cursor: {out:?}");
+        assert!(
+            out.commands.is_empty(),
+            "sleep must not move cursor: {:?}",
+            out.commands
+        );
         let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
         let out = e.on_sample(100, HandSample::open_palm(0.5, 0.5));
-        assert!(out.is_empty(), "sleep must not click: {out:?}");
+        assert!(
+            out.commands.is_empty(),
+            "sleep must not click: {:?}",
+            out.commands
+        );
     }
 
     #[test]
@@ -288,13 +404,17 @@ mod tests {
         let _ = e.on_sample(0, HandSample::open_palm(0.4, 0.4));
         let out = e.on_sample(32, HandSample::open_palm(0.55, 0.4));
         assert!(
-            out.iter().any(|c| matches!(
+            out.commands.iter().any(|c| matches!(
                 c,
                 InjectCommand::MoveAbs { .. } | InjectCommand::MoveDelta { .. }
             )),
-            "G02 should move, got {out:?}"
+            "G02 should move, got {:?}",
+            out.commands
         );
-        assert!(!out.iter().any(|c| matches!(c, InjectCommand::Scroll { .. })));
+        assert!(!out
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::Scroll { .. })));
     }
 
     #[test]
@@ -306,10 +426,13 @@ mod tests {
         let _ = e.on_sample(400, HandSample::fist(0.5, 0.5));
         let out = e.on_sample(432, HandSample::fist(0.5, 0.65));
         assert!(
-            out.iter().any(|c| matches!(c, InjectCommand::Scroll { .. })),
-            "G04 fist+translate should scroll, got {out:?}"
+            out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::Scroll { .. })),
+            "G04 fist+translate should scroll, got {:?}",
+            out.commands
         );
-        assert!(!out.iter().any(|c| matches!(
+        assert!(!out.commands.iter().any(|c| matches!(
             c,
             InjectCommand::MoveAbs { .. } | InjectCommand::MoveDelta { .. }
         )));
@@ -322,8 +445,137 @@ mod tests {
         let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.2));
         let out = e.on_sample(80, HandSample::open_palm(0.5, 0.55));
         assert!(
-            out.iter().any(|c| matches!(c, InjectCommand::KeyEscape)),
-            "G05 swipe down → Esc, got {out:?}"
+            out.commands
+                .iter()
+                .any(|c| matches!(c, InjectCommand::KeyEscape)),
+            "G05 swipe down → Esc, got {:?}",
+            out.commands
         );
+    }
+
+    #[test]
+    fn dwell_0_4s_locks_via_engine_hover() {
+        struct FixedProbe(FocusTarget);
+        impl FocusProbe for FixedProbe {
+            fn hit_test(&self, _x: i32, _y: i32) -> Option<FocusTarget> {
+                Some(self.0.clone())
+            }
+        }
+        let t = FocusTarget {
+            id: "edit-1".into(),
+            label: "input".into(),
+            is_editable: true,
+        };
+        let mut e = engine().with_probe(Box::new(FixedProbe(t.clone())));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        assert!(e.focus_lock().locked().is_none());
+        let _ = e.on_sample(400, HandSample::open_palm(0.51, 0.5));
+        assert_eq!(e.focus_lock().locked(), Some(&t));
+    }
+
+    #[test]
+    fn g07_under_1s_no_record_no_append() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let mid = e.on_sample(500, HandSample::fist(0.5, 0.5));
+        assert!(!e.is_recording());
+        assert!(!mid
+            .g07_events
+            .iter()
+            .any(|ev| matches!(ev, G07Event::RecordingStarted)));
+        let out = e.on_sample(600, HandSample::open_palm(0.5, 0.5));
+        assert!(!out
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::AppendText { .. })));
+    }
+
+    #[test]
+    fn g07_at_1s_starts_recording() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(1010, HandSample::fist(0.5, 0.5));
+        assert!(e.is_recording());
+        assert!(out
+            .g07_events
+            .iter()
+            .any(|ev| matches!(ev, G07Event::RecordingStarted)));
+    }
+
+    #[test]
+    fn g07_leave_frame_aborts() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1010, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(1200, HandSample::absent());
+        assert!(!e.is_recording());
+        assert!(out
+            .g07_events
+            .iter()
+            .any(|ev| matches!(ev, G07Event::RecordingAborted)));
+        assert!(!out
+            .commands
+            .iter()
+            .any(|c| matches!(c, InjectCommand::AppendText { .. })));
+    }
+
+    #[test]
+    fn g07_release_appends_stub_asr_text() {
+        let mut e = engine().with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.5, 0.5));
+        let _ = e.on_sample(10, HandSample::fist(0.5, 0.5));
+        let _ = e.on_sample(1010, HandSample::fist(0.5, 0.5));
+        let out = e.on_sample(1500, HandSample::open_palm(0.5, 0.5));
+        let append = out
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                InjectCommand::AppendText { text } => Some(text.as_str()),
+                _ => None,
+            });
+        let text = append.expect("AppendText on release");
+        assert!(!text.is_empty());
+        assert!(text.chars().any(|c| c > '\u{7f}'));
+        assert!(out
+            .g07_events
+            .iter()
+            .any(|ev| matches!(ev, G07Event::DictationReady { .. })));
+    }
+
+    #[test]
+    fn gesture_move_does_not_clear_focus_or_stop_recording() {
+        struct FixedProbe(FocusTarget);
+        impl FocusProbe for FixedProbe {
+            fn hit_test(&self, _x: i32, _y: i32) -> Option<FocusTarget> {
+                Some(self.0.clone())
+            }
+        }
+        let t = FocusTarget {
+            id: "edit-1".into(),
+            label: "input".into(),
+            is_editable: true,
+        };
+        let mut e = engine()
+            .with_probe(Box::new(FixedProbe(t.clone())))
+            .with_asr(Box::new(StubAsr));
+        e.set_tier(VisionTier::Active);
+        let _ = e.on_sample(0, HandSample::open_palm(0.4, 0.4));
+        let _ = e.on_sample(400, HandSample::open_palm(0.4, 0.4));
+        assert_eq!(e.focus_lock().locked(), Some(&t));
+        let _ = e.on_sample(410, HandSample::fist(0.4, 0.4));
+        let _ = e.on_sample(1410, HandSample::fist(0.5, 0.5));
+        assert!(e.is_recording());
+        // Fist translate while recording must not unlock focus.
+        let _ = e.on_sample(1450, HandSample::fist(0.55, 0.6));
+        assert_eq!(e.focus_lock().locked(), Some(&t));
+        assert!(e.is_recording());
     }
 }
