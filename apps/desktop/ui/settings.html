@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkDance 设置</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>WorkDance 设置</h1>
+    <p class="sub">本地配置 · 音视频不离开本机</p>
+  </header>
+
+  <section class="section">
+    <h2>手势</h2>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">手势总开关</div>
+        <div class="row-desc">关闭后不移动光标；可与「仅语音」配合</div>
+      </div>
+      <div class="row-control">
+        <label class="switch"><input id="gestureEnabled" type="checkbox" /><span></span></label>
+      </div>
+    </div>
+    <div class="row stack">
+      <div class="row-head">
+        <div class="row-main">
+          <div class="row-title">灵敏度</div>
+        </div>
+      </div>
+      <div class="slider-wrap">
+        <input id="sensitivity" type="range" min="0" max="100" value="70" />
+        <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
+      </div>
+    </div>
+    <div class="row stack">
+      <div class="row-head">
+        <div class="row-main">
+          <div class="row-title">死区</div>
+        </div>
+      </div>
+      <div class="slider-wrap">
+        <input id="deadZone" type="range" min="0" max="40" value="15" />
+        <div class="slider-labels"><span>更灵敏</span><span>更抗抖</span></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">摄像头模式</div>
+        <div class="row-desc">性能档优先更低延迟</div>
+      </div>
+      <div class="row-control">
+        <div class="seg" id="cameraMode">
+          <button type="button" data-value="performance" class="active">性能</button>
+          <button type="button" data-value="hd">高清</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>语音</h2>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">仅语音兜底</div>
+        <div class="row-desc">关闭手势光标；托盘「开始听写」武装麦克风听写（无需握拳）</div>
+      </div>
+      <div class="row-control">
+        <label class="switch"><input id="voiceOnly" type="checkbox" /><span></span></label>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">听写语言</div>
+        <div class="row-desc">第一刀中文听写</div>
+      </div>
+      <div class="row-control">
+        <div class="seg" id="asrLanguage">
+          <button type="button" data-value="zh" class="active">中文</button>
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">听写模型</div>
+        <div class="row-desc">Base 更准，Tiny 更轻</div>
+      </div>
+      <div class="row-control">
+        <div class="seg" id="asrModel">
+          <button type="button" data-value="tiny" class="active">Tiny</button>
+          <button type="button" data-value="base">Base · 更准</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>常规</h2>
+    <div class="row stack">
+      <div class="row-main">
+        <div class="row-title">备忘录路径</div>
+        <div class="row-desc">G08 听写草稿落盘位置（仅 Markdown，不存音频）</div>
+      </div>
+      <div class="path-field">
+        <input id="notesPath" type="text" />
+      </div>
+    </div>
+    <div class="row stack">
+      <div class="row-main">
+        <div class="row-title">备忘搜索</div>
+        <div class="row-desc">按标题/正文子串过滤本地 MD</div>
+      </div>
+      <div class="path-field" style="display:flex;gap:8px;align-items:center;">
+        <input id="notesQuery" type="text" placeholder="关键词…" style="flex:1;" />
+        <button class="btn btn-sm" id="searchNotes" type="button">搜索</button>
+      </div>
+      <pre id="notesHits" class="sub" style="margin:8px 0 0;white-space:pre-wrap;max-height:120px;overflow:auto;"></pre>
+    </div>
+    <div class="row">
+      <div class="row-main">
+        <div class="row-title">开机自启</div>
+        <div class="row-desc">登录后驻留系统托盘</div>
+      </div>
+      <div class="row-control">
+        <label class="switch"><input id="launchAtStartup" type="checkbox" /><span></span></label>
+      </div>
+    </div>
+  </section>
+
+  <!-- Dev-only tray state demo; collapsed by default (Lumen QA). -->
+  <details class="dev-demo">
+    <summary>开发演示</summary>
+    <div class="row">
+      <div id="modePill" class="mode-pill"><span class="dot"></span><span id="modeLabel">休眠</span></div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm" id="cycleMode" type="button">手动切换</button>
+        <button class="btn btn-sm" id="autoMode" type="button">恢复自动</button>
+      </div>
+    </div>
+    <p class="sub" style="margin:0 0 10px;">休眠与手势开默认由视觉状态机驱动；录音仍可手动切换。</p>
+  </details>
+
+  <div class="footer space-between">
+    <button class="btn btn-ghost" id="openPermissions" type="button">权限</button>
+    <div style="display:flex;gap:10px;">
+      <button class="btn" id="openCalibration" type="button">校准</button>
+      <button class="btn btn-primary" id="save" type="button">保存</button>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    const state = {
+      gesture_enabled: true,
+      voice_only: false,
+      sensitivity: 0.7,
+      dead_zone: 0.15,
+      notes_path: "~/Documents/WorkDance",
+      launch_at_startup: true,
+      camera_mode: "performance",
+      asr_model: "tiny",
+      asr_language: "zh",
+      calibration: { confirmed: false, corners: [] },
+      first_run_done: false,
+    };
+
+    function fill() {
+      document.getElementById("gestureEnabled").checked = state.gesture_enabled;
+      document.getElementById("voiceOnly").checked = state.voice_only;
+      document.getElementById("sensitivity").value = Math.round(state.sensitivity * 100);
+      document.getElementById("deadZone").value = Math.round(state.dead_zone * 100);
+      document.getElementById("notesPath").value = state.notes_path;
+      document.getElementById("launchAtStartup").checked = state.launch_at_startup;
+      WD.setSeg(document.getElementById("cameraMode"), state.camera_mode);
+      WD.setSeg(document.getElementById("asrModel"), state.asr_model);
+      WD.setSeg(document.getElementById("asrLanguage"), state.asr_language || "zh");
+    }
+
+    function readForm() {
+      state.gesture_enabled = document.getElementById("gestureEnabled").checked;
+      state.voice_only = document.getElementById("voiceOnly").checked;
+      if (state.voice_only) state.gesture_enabled = false;
+      state.sensitivity = Number(document.getElementById("sensitivity").value) / 100;
+      state.dead_zone = Number(document.getElementById("deadZone").value) / 100;
+      state.notes_path = document.getElementById("notesPath").value.trim();
+      state.launch_at_startup = document.getElementById("launchAtStartup").checked;
+      return state;
+    }
+
+    function paintMode(view) {
+      const pill = document.getElementById("modePill");
+      const label = document.getElementById("modeLabel");
+      pill.classList.remove("gesture", "recording");
+      if (view.mode === "gesture_active") {
+        pill.classList.add("gesture");
+        label.textContent = "手势开";
+      } else if (view.mode === "recording") {
+        pill.classList.add("recording");
+        label.textContent = `录音 · ${view.recording_seconds || 0}s`;
+      } else {
+        label.textContent = "休眠";
+      }
+    }
+
+    function syncSliderFill(el) {
+      const min = Number(el.min) || 0;
+      const max = Number(el.max) || 100;
+      const pct = ((Number(el.value) - min) / (max - min)) * 100;
+      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, #2a3340 ${pct}%)`;
+      el.style.backgroundSize = "100% 3px";
+      el.style.backgroundRepeat = "no-repeat";
+      el.style.backgroundPosition = "center";
+    }
+
+    WD.bindSeg(document.getElementById("cameraMode"), (v) => (state.camera_mode = v));
+    WD.bindSeg(document.getElementById("asrModel"), (v) => (state.asr_model = v));
+    WD.bindSeg(document.getElementById("asrLanguage"), (v) => (state.asr_language = v));
+
+    const sens = document.getElementById("sensitivity");
+    sens.addEventListener("input", () => syncSliderFill(sens));
+    const dead = document.getElementById("deadZone");
+    dead.addEventListener("input", () => syncSliderFill(dead));
+
+    document.getElementById("voiceOnly").addEventListener("change", (e) => {
+      if (e.target.checked) {
+        document.getElementById("gestureEnabled").checked = false;
+      }
+    });
+    document.getElementById("gestureEnabled").addEventListener("change", (e) => {
+      if (e.target.checked) {
+        document.getElementById("voiceOnly").checked = false;
+      }
+    });
+
+    document.getElementById("save").onclick = async () => {
+      try {
+        const saved = await WD.invoke("save_settings", { patch: readForm() });
+        Object.assign(state, saved);
+        fill();
+        WD.toast("已保存");
+      } catch (e) {
+        WD.toast("当前为预览，未写入本地配置");
+      }
+    };
+
+    document.getElementById("cycleMode").onclick = async () => {
+      try {
+        const view = await WD.invoke("cycle_mode");
+        paintMode(view);
+      } catch {
+        const order = ["sleep", "gesture_active", "recording"];
+        const cur = order.indexOf(state._mode || "sleep");
+        const next = order[(cur + 1) % 3];
+        state._mode = next;
+        paintMode({
+          mode: next,
+          label_zh: next,
+          recording_seconds: next === "recording" ? 47 : 0,
+        });
+      }
+    };
+
+    document.getElementById("autoMode").onclick = async () => {
+      try {
+        const view = await WD.invoke("clear_manual_override");
+        paintMode(view);
+        WD.toast("已恢复自动");
+      } catch {
+        WD.toast("当前为预览");
+      }
+    };
+
+    document.getElementById("openCalibration").onclick = async () => {
+      try { await WD.invoke("open_named_window", { label: "calibration" }); }
+      catch { location.href = "calibration.html"; }
+    };
+    document.getElementById("openPermissions").onclick = async () => {
+      try { await WD.invoke("open_named_window", { label: "permissions" }); }
+      catch { location.href = "permissions.html"; }
+    };
+
+    document.getElementById("searchNotes").onclick = async () => {
+      const query = document.getElementById("notesQuery").value.trim();
+      const out = document.getElementById("notesHits");
+      try {
+        const hits = await WD.invoke("search_notes", { query });
+        if (!hits.length) {
+          out.textContent = "（无匹配）";
+          return;
+        }
+        out.textContent = hits
+          .map((h) => `${h.title}\n  ${h.path}\n  ${h.snippet}`)
+          .join("\n\n");
+      } catch (e) {
+        out.textContent = String(e);
+      }
+    };
+
+    (async () => {
+      try {
+        const cfg = await WD.invoke("get_config");
+        Object.assign(state, cfg);
+        fill();
+        syncSliderFill(sens);
+        syncSliderFill(dead);
+        const mode = await WD.invoke("get_mode");
+        paintMode(mode);
+      } catch {
+        fill();
+        syncSliderFill(sens);
+        syncSliderFill(dead);
+        paintMode({ mode: "sleep", label_zh: "休眠", recording_seconds: 0 });
+      }
+    })();
+  </script>
+</body>
+</html>

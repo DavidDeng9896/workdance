@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>首次设置</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <div class="eyebrow">首次设置</div>
+    <div class="dots" aria-hidden="true"><i class="on"></i><i></i><i></i></div>
+    <h1>授予必要权限</h1>
+    <p class="sub">WorkDance 需要以下系统权限，才能在实验台旁免触控操作。</p>
+  </header>
+
+  <div class="perm-list" id="list"></div>
+
+  <div class="footer space-between">
+    <button class="btn" id="later" type="button">稍后</button>
+    <button class="btn btn-primary" id="continue" type="button">继续</button>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    /* Inline line icons — no letter blocks (Lumen QA). */
+    const ICONS = {
+      camera: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h2l1.2-1.8A1.5 1.5 0 0 1 10.9 3.5h2.2c.5 0 1 .25 1.2.7L15.5 6h2A2.5 2.5 0 0 1 20 8.5v8A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5v-8Z"/><circle cx="12" cy="12.5" r="3.2"/></svg>`,
+      microphone: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M6.5 11.5a5.5 5.5 0 0 0 11 0"/><path d="M12 17v3.5"/><path d="M9 20.5h6"/></svg>`,
+      accessibility_or_input: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="12" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="8.5" cy="11" r="1"/><circle cx="12" cy="11" r="1"/><circle cx="15.5" cy="11" r="1"/></svg>`,
+    };
+    const titles = {
+      camera: "摄像头",
+      microphone: "麦克风",
+      accessibility_or_input: "辅助功能 (Mac) / 输入模拟 (Win)",
+    };
+    const descs = {
+      camera: "内置前置 · 用于手势追踪",
+      microphone: "中文听写 · 仅在录音时启用",
+      accessibility_or_input: "控制鼠标与键盘输入",
+    };
+
+    function statusClass(s) {
+      if (s === "granted") return "status-ok";
+      if (s === "missing") return "status-miss";
+      return "status-unk";
+    }
+    function statusLabel(s) {
+      if (s === "granted") return "已允许";
+      if (s === "missing") return "未授权";
+      return "未知";
+    }
+
+    function render(snap) {
+      const list = document.getElementById("list");
+      const rows = [
+        ["camera", snap.camera],
+        ["microphone", snap.microphone],
+        ["accessibility_or_input", snap.accessibility_or_input],
+      ];
+      list.innerHTML = rows
+        .map(([key, status]) => {
+          const action =
+            key === "accessibility_or_input"
+              ? `<button class="btn btn-outline btn-sm" data-open-os type="button">去开启</button>`
+              : `<span class="${statusClass(status)}">${statusLabel(status)}</span>`;
+          return `<div class="perm-item">
+            <div class="perm-icon">${ICONS[key]}</div>
+            <div class="perm-body">
+              <div class="row-title">${titles[key]}</div>
+              <div class="row-desc">${descs[key]}</div>
+            </div>
+            ${action}
+          </div>`;
+        })
+        .join("");
+
+      list.querySelectorAll("[data-open-os]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          try {
+            await WD.invoke("open_os_permission_settings");
+          } catch (e) {
+            WD.toast(String(e.message || e));
+          }
+        });
+      });
+    }
+
+    async function dismiss(goCalibration) {
+      try { await WD.invoke("mark_first_run_done"); } catch {}
+      if (goCalibration) {
+        try {
+          await WD.invoke("open_named_window", { label: "calibration" });
+        } catch {
+          location.href = "calibration.html";
+          return;
+        }
+      }
+      try {
+        const { getCurrentWindow } = window.__TAURI__.window;
+        await getCurrentWindow().hide();
+      } catch {
+        /* preview */
+      }
+    }
+
+    document.getElementById("later").onclick = () => dismiss(false);
+    document.getElementById("continue").onclick = () => dismiss(true);
+
+    (async () => {
+      try {
+        render(await WD.invoke("get_permissions"));
+      } catch {
+        render({
+          camera: "unknown",
+          microphone: "unknown",
+          accessibility_or_input: "unknown",
+          platform: "preview",
+          notes: [],
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WorkDance 校准</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+    <div>
+      <h1>校准</h1>
+      <p class="sub">请用食指依次指向屏幕四角，完成前置平面校准</p>
+    </div>
+    <button class="btn btn-sm" id="toSettings" type="button">设置</button>
+  </header>
+
+  <div class="cal-stage" aria-label="calibration stage">
+    <div class="corner tl active" data-corner="0"></div>
+    <div class="corner-hint">用食指指向此角</div>
+    <div class="corner tr" data-corner="1"></div>
+    <div class="corner bl" data-corner="2"></div>
+    <div class="corner br" data-corner="3"></div>
+    <div class="cal-preview">
+      <div>
+        <div style="font-size:14px;color:#c9d5e5;margin-bottom:6px;">摄像头预览</div>
+        <div class="sub" id="deviceList">等待内置前置画面</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cal-hud">
+    <div class="row-title">四点校准</div>
+    <div class="row-desc" id="progressText">请依次指向屏幕四角 · 进度 1/4</div>
+    <div class="progress" id="progress"><span class="on"></span><span></span><span></span><span></span></div>
+  </div>
+
+  <section class="section">
+    <h2>参数</h2>
+    <div class="row stack">
+      <div class="row-title">灵敏度</div>
+      <div class="slider-wrap">
+        <input id="sensitivity" type="range" min="0" max="100" value="70" />
+        <div class="slider-labels"><span>偏低更稳</span><span>偏高更跟手</span></div>
+      </div>
+    </div>
+    <div class="row stack">
+      <div class="row-title">死区</div>
+      <div class="slider-wrap">
+        <input id="deadZone" type="range" min="0" max="100" value="15" />
+        <div class="slider-labels"><span>更小死区</span><span>更大死区</span></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="footer">
+    <button class="btn" id="nextCorner" type="button">下一步</button>
+    <button class="btn btn-primary" id="confirm" type="button">确认并保存</button>
+  </div>
+
+  <script src="common.js"></script>
+  <script>
+    let step = 1;
+    const corners = [...document.querySelectorAll(".corner")];
+
+    function syncSliderFill(el) {
+      const min = Number(el.min) || 0;
+      const max = Number(el.max) || 100;
+      const pct = ((Number(el.value) - min) / (max - min)) * 100;
+      el.style.background = `linear-gradient(90deg, var(--accent-deep) ${pct}%, #2a3340 ${pct}%)`;
+      el.style.backgroundSize = "100% 3px";
+      el.style.backgroundRepeat = "no-repeat";
+      el.style.backgroundPosition = "center";
+    }
+
+    function paintStep() {
+      corners.forEach((c, i) => c.classList.toggle("active", i === step - 1));
+      document.getElementById("progressText").textContent =
+        `请依次指向屏幕四角 · 进度 ${step}/4`;
+      [...document.getElementById("progress").children].forEach((el, i) => {
+        el.classList.toggle("on", i < step);
+      });
+      const hint = document.querySelector(".corner-hint");
+      if (hint) {
+        const active = corners[step - 1];
+        hint.style.display = "block";
+        if (active.classList.contains("tl")) {
+          hint.style.left = "56px";
+          hint.style.right = "auto";
+          hint.style.top = "22px";
+          hint.style.bottom = "auto";
+        } else if (active.classList.contains("tr")) {
+          hint.style.left = "auto";
+          hint.style.right = "56px";
+          hint.style.top = "22px";
+          hint.style.bottom = "auto";
+        } else if (active.classList.contains("bl")) {
+          hint.style.left = "56px";
+          hint.style.right = "auto";
+          hint.style.top = "auto";
+          hint.style.bottom = "22px";
+        } else {
+          hint.style.left = "auto";
+          hint.style.right = "56px";
+          hint.style.top = "auto";
+          hint.style.bottom = "22px";
+        }
+      }
+    }
+
+    document.getElementById("nextCorner").onclick = () => {
+      step = step >= 4 ? 1 : step + 1;
+      paintStep();
+    };
+
+    document.getElementById("confirm").onclick = async () => {
+      const sensitivity = Number(document.getElementById("sensitivity").value) / 100;
+      const dead_zone = Number(document.getElementById("deadZone").value) / 100;
+      try {
+        await WD.invoke("save_calibration", {
+          sensitivity,
+          dead_zone,
+          confirm: true,
+        });
+        WD.toast("校准已保存");
+      } catch {
+        WD.toast("当前为预览，未写入");
+      }
+    };
+
+    document.getElementById("toSettings").onclick = async () => {
+      try { await WD.invoke("open_named_window", { label: "settings" }); }
+      catch { location.href = "settings.html"; }
+    };
+
+    const sens = document.getElementById("sensitivity");
+    const dead = document.getElementById("deadZone");
+    sens.addEventListener("input", () => syncSliderFill(sens));
+    dead.addEventListener("input", () => syncSliderFill(dead));
+
+    (async () => {
+      try {
+        const cfg = await WD.invoke("get_config");
+        sens.value = Math.round(cfg.sensitivity * 100);
+        dead.value = Math.round(cfg.dead_zone * 100);
+      } catch {}
+      syncSliderFill(sens);
+      syncSliderFill(dead);
+      paintStep();
+    })();
+  </script>
+</body>
+</html>

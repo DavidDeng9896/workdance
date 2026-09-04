@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/workdance-core",
+  "crates/workdance-vision",
+  "crates/workdance-input",
+  "apps/desktop/src-tauri",
+]
+default-members = [
+  "crates/workdance-core",
+  "crates/workdance-vision",
+  "crates/workdance-input",
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["WorkDance"]
+repository = "https://github.com/DavidDeng9896/workdance"
+
+[workspace.dependencies]
+workdance-core = { path = "crates/workdance-core" }
+workdance-vision = { path = "crates/workdance-vision" }
+workdance-input = { path = "crates/workdance-input" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+dirs = "6"
+parking_lot = "0.12"

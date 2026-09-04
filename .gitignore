@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+apps/desktop/node_modules
+apps/desktop/src-tauri/gen
+apps/desktop/src-tauri/target
+*.log
+.idea
+.vscode
