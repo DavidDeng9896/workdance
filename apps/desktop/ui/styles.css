@@ -548,7 +548,10 @@ input[type="range"]::-moz-range-thumb {
   height: 100%;
   z-index: 2;
   pointer-events: none;
-  opacity: 0.85;
+  opacity: 0.75;
+}
+.continuity-pip[data-mode="recording"] .pip-skeleton {
+  opacity: 0.28;
 }
 .pip-label {
   position: absolute;

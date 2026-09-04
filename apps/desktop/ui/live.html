@@ -98,7 +98,9 @@
       const skCtx = sk.getContext("2d");
       WD.drawFaintSkeleton(skCtx, WD.mockHandLandmarks(sk.width, sk.height), {
         tipIndex: 8,
-        accent: scene === "recording" ? "#e25555" : "#3b82f6",
+        // Recording: muted red, quieter Continuity opacity (not heavy REC-red mesh).
+        accent: scene === "recording" ? "rgba(226,85,85,0.42)" : "#3b82f6",
+        opacity: scene === "recording" ? 0.4 : 1,
       });
     })();
   </script>

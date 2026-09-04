@@ -76,15 +76,18 @@ const HAND_EDGES = [
 ];
 
 function drawFaintSkeleton(ctx, pts, opts = {}) {
-  const accent = opts.accent || "rgba(59,130,246,0.75)";
+  // Quiet Continuity default; recording may pass a muted red + lower opacity.
   const tipIndex = opts.tipIndex ?? 8;
+  const opacity = opts.opacity ?? 1;
+  const accent = opts.accent || "rgba(59,130,246,0.55)";
+  const isRed = /226\s*,\s*85\s*,\s*85|#e25555/i.test(accent);
+  const stroke = isRed ? "rgba(226,85,85,0.14)" : (accent.startsWith("#") ? accent + "40" : "rgba(59,130,246,0.28)");
+  const joint = isRed ? "rgba(226,85,85,0.22)" : (accent.startsWith("#") ? accent + "55" : "rgba(59,130,246,0.4)");
+  const tip = isRed ? "rgba(226,85,85,0.36)" : (accent.startsWith("#") ? accent + "70" : "rgba(96,165,250,0.7)");
   ctx.save();
-  ctx.lineWidth = 1.2;
-  ctx.strokeStyle = accent.replace("0.75", "0.35").replace(/rgba?\(([^)]+)\)/, (_, inner) => {
-    if (accent.startsWith("#")) return accent + "55";
-    return `rgba(${inner})`;
-  });
-  if (accent.startsWith("#")) ctx.strokeStyle = accent + "66";
+  ctx.globalAlpha = opacity;
+  ctx.lineWidth = 1.1;
+  ctx.strokeStyle = stroke;
   ctx.beginPath();
   for (const [a, b] of HAND_EDGES) {
     if (!pts[a] || !pts[b]) continue;
@@ -95,20 +98,20 @@ function drawFaintSkeleton(ctx, pts, opts = {}) {
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
     if (!p) continue;
-    const r = i === tipIndex ? 3.5 : 1.8;
+    const r = i === tipIndex ? 3 : 1.5;
     ctx.beginPath();
-    ctx.fillStyle = i === tipIndex ? accent : (accent.startsWith("#") ? accent + "99" : accent);
+    ctx.fillStyle = i === tipIndex ? tip : joint;
     ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.fill();
   }
   if (pts[tipIndex]) {
     const p = pts[tipIndex];
-    const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 10);
-    g.addColorStop(0, accent.startsWith("#") ? accent + "aa" : accent);
+    const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 8);
+    g.addColorStop(0, tip);
     g.addColorStop(1, "transparent");
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.restore();
