@@ -167,7 +167,7 @@ fn run_loop(shared: Arc<Shared>) {
             vision = None;
             let decisions = {
                 let mut gate = shared.gate.lock();
-                if gate.snapshot().enabled {
+                if gate.snapshot().gesture_enabled {
                     gate.set_enabled(false)
                 } else {
                     Vec::new()
@@ -269,7 +269,7 @@ fn current_screen(app: &AppHandle, mirror_x: bool) -> Screen {
 
 fn publish(shared: &Shared, camera_open: bool) {
     let snapshot = shared.gate.lock().snapshot();
-    let tray = snapshot.tray;
+    let tray = snapshot.gate_state;
     let tooltip = tray.tooltip();
     {
         let mut status = shared.status.lock();

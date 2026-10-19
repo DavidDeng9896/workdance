@@ -1074,7 +1074,7 @@ export function Capsule({ os: forcedOs }: CapsuleProps = {}) {
   // Truly unmounted: state is idle and no exit animation is running.
   // WorkDance still paints its four tray states on this capsule when a hand is present.
   if (state === 'idle' && !leaving) {
-    if (workdanceTray && workdanceTray.state !== 'quiet') {
+    if (workdanceTray && workdanceTray.state !== 'idle') {
       return (
         <div
           style={{

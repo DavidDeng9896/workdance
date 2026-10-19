@@ -14,7 +14,7 @@ Windows and macOS verify the shell with the command below.
 | --- | --- |
 | `DictationHotkeyEdge::Pressed` / `Released` | `Coordinator::dispatch_workdance_dictation_edge` → `dictation::handle_pressed_edge` / `handle_released_edge` → `OpenLessBackend::dispatch_dictation_hotkey_edge` |
 | `TextInserter::insert` (and clipboard restore / unicode keystrokes / `copy_fallback`) | `workdance_gesture::IoGuard` so pointer injection cannot overlap an insert |
-| Tray id `main-tray` | Tooltip `WorkDance · 安静 / Quiet` (and the other three states) |
+| Tray id `main-tray` | Tooltip `WorkDance · 安静 / Idle` (正在听手 / 正在录音 / 刚误触停一下) |
 | Capsule event channel | `workdance:tray` listened to by `Capsule.tsx` when the capsule is idle |
 
 ASR is still OpenLess: local sherpa/foundry **and** the existing cloud/API providers. Gesture code does not pick a provider.
@@ -28,36 +28,37 @@ Tauri commands (desktop):
 - `workdance_gesture_last_decision` → `DecisionKind`
 - `workdance_gesture_event_counts` → `EventCounts`
 
-`GateSnapshot` (camelCase JSON):
+`GateSnapshot` (snake_case JSON; Aegis asserts the four bold fields):
 
 | Field | Meaning |
 | --- | --- |
-| `enabled` | Gesture loop allowed |
-| `tray` | `quiet` / `tracking` / `recording` / `mis_touch_pause` |
+| **`gesture_enabled`** | Gesture loop allowed |
+| **`gate_state`** | `idle` / `tracking` / `recording` / `reject_cooldown` (= Lumen 安静 / 正在听手 / 正在录音 / 刚误触停一下) |
 | `pose` | `absent` / `open_palm` / `fist` / `other` |
 | `recording` | This gate owns a long-fist dictation |
-| `landmarkCount` | `0` or `21` |
-| `fistHeldMs` | Current fist age |
-| `misTouchRemainingMs` | Pause left after an ignored fist |
-| `lastDecision` | `none` / `move` / `click` / `dictation_pressed` / `dictation_released` |
-| `counts.moveEvents` | Open-palm pointer moves |
-| `counts.click` | Short-fist releases |
-| `counts.scroll` | Always `0` (not implemented) |
-| `counts.dictationEdge` | Pressed + released edges |
-| `shortFistMaxMs` | Provisional `400` |
-| `longFistMinMs` | Provisional `800` |
-| `misTouchPauseMs` | Provisional `350` |
-| `thresholdsProvisional` | Always `true` until a tuning pass |
-| `scrollImplemented` | Always `false` |
+| `landmark_count` | `0` or `21` |
+| `fist_held_ms` | Current fist age |
+| `mis_touch_remaining_ms` | Pause left after an ignored fist |
+| **`last_decision`** | `none` / `move` / `click` / `dictation_pressed` / `dictation_released` |
+| **`session_counts.move`** | Open-palm pointer moves |
+| **`session_counts.click`** | Short-fist releases |
+| **`session_counts.scroll`** | Always `0` (not implemented; G-10～12 later) |
+| **`session_counts.dictation_pressed`** | Long-fist dictation start edges |
+| **`session_counts.dictation_released`** | Dictation stop edges (open hand or leave frame) |
+| `short_fist_max_ms` | Provisional `400` |
+| `long_fist_min_ms` | Provisional `800` |
+| `mis_touch_pause_ms` | Provisional `350` |
+| `thresholds_provisional` | Always `true` until a tuning pass |
+| `scroll_implemented` | Always `false` |
 
-`DecisionKind` and `EventCounts` are the same names as the commands.
+Commands still named `workdance_gesture_*`; returned JSON uses the fields above.
 
 Host status (in-process, not a separate command) also tracks `cameraOpen`, `trackerError`, and `frontCameraMirrorX`.
 
 ## Provisional behavior (not claimed as tuned)
 
 - Short fist: release **before 400 ms** → left click.
-- **400–799 ms** → no click, no dictation, tray `mis_touch_pause` for 350 ms.
+- **400–799 ms** → no click, no dictation, tray `reject_cooldown` for 350 ms.
 - **≥ 800 ms** still closed → `DictationHotkeyEdge::Pressed`. Keep the fist while speaking.
 - Open the hand **or** leave the frame → `Released`. If the keyboard mode ignores key-up (Toggle), the host then calls `stop_dictation` so text still inserts.
 - While that session is starting, recording, transcribing, polishing, or inserting: no move, no click, no scroll.
@@ -106,9 +107,9 @@ Keyboard hold-to-talk is the fallback and does not go through the gesture gate.
 ## Manual checks
 
 1. Hotkey dictation still inserts the transcript (OpenLess provider unchanged).
-2. Open five fingers in frame: tray tooltip becomes `WorkDance · 跟踪 / Tracking`. Cursor follows the palm. No still-hold wake.
-3. Fist shorter than ~0.4 s, then open: one left click. `counts.click` increments. No dictation.
-4. Fist held in the 0.4–0.8 s band, then open: no click. Tray `误触暂停 / Mis-touch pause`. Pointer stays put until the pause ends.
-5. Fist held ≥ ~0.8 s: dictation starts, pointer freezes. Open the hand or leave the frame: dictation stops and text inserts. `counts.dictationEdge` increases by 2.
+2. Open five fingers in frame: tray tooltip becomes `WorkDance · 正在听手 / Tracking`. Cursor follows the palm. No still-hold wake.
+3. Fist shorter than ~0.4 s, then open: one left click. `session_counts.click` increments. No dictation.
+4. Fist held in the 0.4–0.8 s band, then open: no click. Tray `刚误触停一下 / Reject cooldown`. Pointer stays put until the pause ends.
+5. Fist held ≥ ~0.8 s: dictation starts, pointer freezes. Open the hand or leave the frame: dictation stops and text inserts. `session_counts.dictation_pressed` and `dictation_released` each +1.
 6. Hand leaves before a short click completes: no click.
-7. `counts.scroll` stays 0.
+7. `session_counts.scroll` stays 0.

@@ -27,5 +27,5 @@ pub fn workdance_gesture_last_decision(runtime: State<'_, Arc<WorkdanceRuntime>>
 
 #[tauri::command]
 pub fn workdance_gesture_event_counts(runtime: State<'_, Arc<WorkdanceRuntime>>) -> EventCounts {
-    runtime.status().gate.counts
+    runtime.status().gate.session_counts
 }

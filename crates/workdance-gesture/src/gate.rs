@@ -20,28 +20,28 @@ pub const PROVISIONAL_MISTOUCH_PAUSE_MS: u64 = 350;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrayState {
-    Quiet,
+    Idle,
     Tracking,
     Recording,
-    MisTouchPause,
+    RejectCooldown,
 }
 
 impl TrayState {
     pub fn label_zh(self) -> &'static str {
         match self {
-            Self::Quiet => "安静",
-            Self::Tracking => "跟踪",
-            Self::Recording => "听写",
-            Self::MisTouchPause => "误触暂停",
+            Self::Idle => "安静",
+            Self::Tracking => "正在听手",
+            Self::Recording => "正在录音",
+            Self::RejectCooldown => "刚误触停一下",
         }
     }
 
     pub fn label_en(self) -> &'static str {
         match self {
-            Self::Quiet => "Quiet",
+            Self::Idle => "Idle",
             Self::Tracking => "Tracking",
             Self::Recording => "Recording",
-            Self::MisTouchPause => "Mis-touch pause",
+            Self::RejectCooldown => "Reject cooldown",
         }
     }
 
@@ -80,27 +80,33 @@ impl Decision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct EventCounts {
-    pub move_events: u64,
+    /// Open-palm pointer moves. Serialized as `move`.
+    #[serde(rename = "move")]
+    pub move_count: u64,
     pub click: u64,
     /// Reserved. Palm-flick scroll is not implemented; this stays 0.
     pub scroll: u64,
-    pub dictation_edge: u64,
+    pub dictation_pressed: u64,
+    pub dictation_released: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct GateSnapshot {
-    pub enabled: bool,
-    pub tray: TrayState,
+    /// Aegis assertion: gesture loop allowed.
+    pub gesture_enabled: bool,
+    /// Aegis assertion: idle / tracking / recording / reject_cooldown.
+    pub gate_state: TrayState,
     pub pose: Pose,
     pub recording: bool,
     pub landmark_count: u8,
     pub fist_held_ms: u64,
     pub mis_touch_remaining_ms: u64,
     pub last_decision: DecisionKind,
-    pub counts: EventCounts,
+    /// Aegis assertion: move / click / scroll / dictation_pressed / dictation_released.
+    pub session_counts: EventCounts,
     pub short_fist_max_ms: u64,
     pub long_fist_min_ms: u64,
     pub mis_touch_pause_ms: u64,
@@ -169,7 +175,7 @@ impl GestureGate {
             last_palm: None,
             last_t_ms: 0,
             pose: Pose::Absent,
-            tray: TrayState::Quiet,
+            tray: TrayState::Idle,
             landmark_count: 0,
             fist_held_ms: 0,
             last_decision: DecisionKind::None,
@@ -183,15 +189,15 @@ impl GestureGate {
             .map(|until| until.saturating_sub(self.last_t_ms))
             .unwrap_or(0);
         GateSnapshot {
-            enabled: self.enabled,
-            tray: self.tray,
+            gesture_enabled: self.enabled,
+            gate_state: self.tray,
             pose: self.pose,
             recording: self.recording,
             landmark_count: self.landmark_count,
             fist_held_ms: self.fist_held_ms,
             mis_touch_remaining_ms: remaining,
             last_decision: self.last_decision,
-            counts: self.counts,
+            session_counts: self.counts,
             short_fist_max_ms: self.cfg.short_max_ms,
             long_fist_min_ms: self.cfg.long_min_ms,
             mis_touch_pause_ms: self.cfg.pause_ms,
@@ -215,7 +221,7 @@ impl GestureGate {
         self.last_palm = None;
         self.pose = Pose::Absent;
         self.landmark_count = 0;
-        self.tray = TrayState::Quiet;
+        self.tray = TrayState::Idle;
         out
     }
 
@@ -226,7 +232,7 @@ impl GestureGate {
         self.fist_started_ms = None;
         self.fist_held_ms = 0;
         if self.tray == TrayState::Recording {
-            self.tray = TrayState::Quiet;
+            self.tray = TrayState::Idle;
         }
     }
 
@@ -279,7 +285,7 @@ impl GestureGate {
         self.fist_held_ms = 0;
         self.last_palm = None;
         if pose == Pose::Absent {
-            self.tray = TrayState::Quiet;
+            self.tray = TrayState::Idle;
             self.mis_touch_until_ms = None;
         } else {
             self.arm_pause(t_ms);
@@ -293,9 +299,9 @@ impl GestureGate {
                 self.fist_held_ms = 0;
                 self.last_palm = None;
                 self.tray = if self.in_pause(obs.t_ms) {
-                    TrayState::MisTouchPause
+                    TrayState::RejectCooldown
                 } else {
-                    TrayState::Quiet
+                    TrayState::Idle
                 };
             }
             Pose::Fist => {
@@ -312,13 +318,13 @@ impl GestureGate {
                     self.tray = TrayState::Recording;
                     self.emit(Decision::DictationPressed, out);
                 } else {
-                    self.tray = TrayState::MisTouchPause;
+                    self.tray = TrayState::RejectCooldown;
                 }
             }
             Pose::OpenPalm => {
                 self.on_fist_release(obs.t_ms, out);
                 if self.in_pause(obs.t_ms) {
-                    self.tray = TrayState::MisTouchPause;
+                    self.tray = TrayState::RejectCooldown;
                     return;
                 }
                 self.tray = TrayState::Tracking;
@@ -334,11 +340,11 @@ impl GestureGate {
                 self.on_fist_release(obs.t_ms, out);
                 self.last_palm = None;
                 if self.in_pause(obs.t_ms) {
-                    self.tray = TrayState::MisTouchPause;
-                } else if self.tray != TrayState::MisTouchPause {
-                    self.tray = TrayState::Quiet;
+                    self.tray = TrayState::RejectCooldown;
+                } else if self.tray != TrayState::RejectCooldown {
+                    self.tray = TrayState::Idle;
                 } else if self.mis_touch_until_ms.is_none() {
-                    self.tray = TrayState::Quiet;
+                    self.tray = TrayState::Idle;
                 }
             }
         }
@@ -372,7 +378,7 @@ impl GestureGate {
 
     fn arm_pause(&mut self, t_ms: u64) {
         self.mis_touch_until_ms = Some(t_ms.saturating_add(self.cfg.pause_ms));
-        self.tray = TrayState::MisTouchPause;
+        self.tray = TrayState::RejectCooldown;
         self.last_palm = None;
     }
 
@@ -400,11 +406,14 @@ impl GestureGate {
         self.last_decision = decision.kind();
         match decision {
             Decision::Move { .. } => {
-                self.counts.move_events = self.counts.move_events.saturating_add(1)
+                self.counts.move_count = self.counts.move_count.saturating_add(1)
             }
             Decision::Click => self.counts.click = self.counts.click.saturating_add(1),
-            Decision::DictationPressed | Decision::DictationReleased => {
-                self.counts.dictation_edge = self.counts.dictation_edge.saturating_add(1);
+            Decision::DictationPressed => {
+                self.counts.dictation_pressed = self.counts.dictation_pressed.saturating_add(1)
+            }
+            Decision::DictationReleased => {
+                self.counts.dictation_released = self.counts.dictation_released.saturating_add(1)
             }
         }
         debug_assert_eq!(self.counts.scroll, 0);
@@ -438,11 +447,11 @@ mod tests {
         let mut g = gate();
         let first = see(&mut g, 0, Some(open_palm(0.0, 0.0)));
         assert!(matches!(first[0], Decision::Move { .. }));
-        assert_eq!(g.snapshot().tray, TrayState::Tracking);
+        assert_eq!(g.snapshot().gate_state, TrayState::Tracking);
         // A large jump on the next frame is still a move (no "slowly" filter).
         let second = see(&mut g, 16, Some(open_palm(0.25, -0.1)));
         assert!(matches!(second.last(), Some(Decision::Move { .. })));
-        assert_eq!(g.snapshot().counts.scroll, 0);
+        assert_eq!(g.snapshot().session_counts.scroll, 0);
         assert_eq!(g.snapshot().landmark_count, 21);
     }
 
@@ -451,8 +460,8 @@ mod tests {
         let mut g = gate();
         let out = see(&mut g, 0, None);
         assert!(out.is_empty());
-        assert_eq!(g.snapshot().tray, TrayState::Quiet);
-        assert_eq!(g.snapshot().counts.move_events, 0);
+        assert_eq!(g.snapshot().gate_state, TrayState::Idle);
+        assert_eq!(g.snapshot().session_counts.move_count, 0);
     }
 
     #[test]
@@ -463,8 +472,8 @@ mod tests {
         let out = see(&mut g, 100 + 399, Some(open_palm(0.0, 0.0)));
         assert!(out.iter().any(|d| matches!(d, Decision::Click)));
         assert!(!out.iter().any(|d| matches!(d, Decision::DictationPressed)));
-        assert_eq!(g.snapshot().counts.click, 1);
-        assert_eq!(g.snapshot().tray, TrayState::MisTouchPause);
+        assert_eq!(g.snapshot().session_counts.click, 1);
+        assert_eq!(g.snapshot().gate_state, TrayState::RejectCooldown);
     }
 
     #[test]
@@ -478,15 +487,15 @@ mod tests {
                     .iter()
                     .all(|d| !matches!(d, Decision::Click | Decision::DictationPressed))
         );
-        assert_eq!(g.snapshot().tray, TrayState::MisTouchPause);
-        assert_eq!(g.snapshot().counts.click, 0);
+        assert_eq!(g.snapshot().gate_state, TrayState::RejectCooldown);
+        assert_eq!(g.snapshot().session_counts.click, 0);
 
         let mut g = gate();
         see(&mut g, 0, Some(fist_at(0.0, 0.0)));
         let left = see(&mut g, 200, None);
         assert!(left.is_empty());
-        assert_eq!(g.snapshot().counts.click, 0);
-        assert_eq!(g.snapshot().tray, TrayState::Quiet);
+        assert_eq!(g.snapshot().session_counts.click, 0);
+        assert_eq!(g.snapshot().gate_state, TrayState::Idle);
     }
 
     #[test]
@@ -497,23 +506,24 @@ mod tests {
         assert!(started.is_empty());
         let armed = see(&mut g, 50 + 800, Some(fist_at(0.02, 0.02)));
         assert_eq!(armed, vec![Decision::DictationPressed]);
-        assert_eq!(g.snapshot().tray, TrayState::Recording);
+        assert_eq!(g.snapshot().gate_state, TrayState::Recording);
         // Still closed, and a later open palm while recording does not move or click.
         assert!(see(&mut g, 900, Some(fist_at(0.1, 0.1))).is_empty());
         let during = see(&mut g, 1000, Some(open_palm(0.2, 0.2)));
         assert_eq!(during, vec![Decision::DictationReleased]);
-        assert_eq!(g.snapshot().counts.move_events, 1);
-        assert_eq!(g.snapshot().counts.click, 0);
-        assert_eq!(g.snapshot().counts.dictation_edge, 2);
-        assert_eq!(g.snapshot().counts.scroll, 0);
+        assert_eq!(g.snapshot().session_counts.move_count, 1);
+        assert_eq!(g.snapshot().session_counts.click, 0);
+        assert_eq!(g.snapshot().session_counts.dictation_pressed, 1);
+        assert_eq!(g.snapshot().session_counts.dictation_released, 1);
+        assert_eq!(g.snapshot().session_counts.scroll, 0);
 
         let mut g = gate();
         see(&mut g, 0, Some(fist_at(0.0, 0.0)));
         see(&mut g, 800, Some(fist_at(0.0, 0.0)));
         let left = see(&mut g, 1200, None);
         assert_eq!(left, vec![Decision::DictationReleased]);
-        assert_eq!(g.snapshot().tray, TrayState::Quiet);
-        assert_eq!(g.snapshot().counts.click, 0);
+        assert_eq!(g.snapshot().gate_state, TrayState::Idle);
+        assert_eq!(g.snapshot().session_counts.click, 0);
     }
 
     #[test]
@@ -529,7 +539,7 @@ mod tests {
             Some(open_palm(0.2, 0.0)),
         );
         assert!(after.iter().any(|d| matches!(d, Decision::Move { .. })));
-        assert_eq!(g.snapshot().tray, TrayState::Tracking);
+        assert_eq!(g.snapshot().gate_state, TrayState::Tracking);
     }
 
     #[test]
@@ -540,9 +550,33 @@ mod tests {
             true,
         );
         assert!(blocked.is_empty());
-        assert_eq!(g.snapshot().tray, TrayState::Recording);
+        assert_eq!(g.snapshot().gate_state, TrayState::Recording);
         let resumed = see(&mut g, 30, Some(open_palm(0.0, 0.0)));
         assert!(matches!(resumed[0], Decision::Move { .. }));
+    }
+
+    #[test]
+    fn aegis_json_fields_use_gate_state_and_session_counts() {
+        let mut g = gate();
+        see(&mut g, 0, Some(open_palm(0.0, 0.0)));
+        see(&mut g, 50, Some(fist_at(0.0, 0.0)));
+        see(&mut g, 50 + 800, Some(fist_at(0.0, 0.0)));
+        let json = serde_json::to_value(g.snapshot()).expect("snapshot json");
+        assert_eq!(json["gate_state"], "recording");
+        assert_eq!(json["gesture_enabled"], true);
+        assert_eq!(json["last_decision"], "dictation_pressed");
+        assert_eq!(json["session_counts"]["move"], 1);
+        assert_eq!(json["session_counts"]["click"], 0);
+        assert_eq!(json["session_counts"]["scroll"], 0);
+        assert_eq!(json["session_counts"]["dictation_pressed"], 1);
+        assert_eq!(json["session_counts"]["dictation_released"], 0);
+        assert!(json.get("tray").is_none());
+        assert!(json.get("enabled").is_none());
+        assert!(json.get("counts").is_none());
+        assert_eq!(TrayState::Idle.label_zh(), "安静");
+        assert_eq!(TrayState::Tracking.label_zh(), "正在听手");
+        assert_eq!(TrayState::Recording.label_zh(), "正在录音");
+        assert_eq!(TrayState::RejectCooldown.label_zh(), "刚误触停一下");
     }
 
     #[test]
@@ -553,6 +587,6 @@ mod tests {
             false,
         );
         assert!(out.is_empty());
-        assert_eq!(g.snapshot().tray, TrayState::Quiet);
+        assert_eq!(g.snapshot().gate_state, TrayState::Idle);
     }
 }

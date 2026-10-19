@@ -5669,6 +5669,7 @@ dependencies = [
  "nokhwa",
  "parking_lot",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
