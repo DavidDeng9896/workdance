@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "OpenLess",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 980,
+        "minHeight": 640,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
+        "hiddenTitle": true,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 20
+        },
+        "visible": false,
+        "acceptFirstMouse": true
+      },
+      {
+        "label": "capsule",
+        "url": "index.html?window=capsule",
+        "title": "OpenLess Capsule",
+        "width": 460,
+        "height": 180,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "visible": false,
+        "center": false,
+        "acceptFirstMouse": true
+      },
+      {
+        "label": "capsule-rail",
+        "url": "index.html?window=capsule-rail&os=win",
+        "title": "OpenLess Transcript Rail",
+        "width": 460,
+        "height": 52,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "visible": false,
+        "center": false,
+        "acceptFirstMouse": false
+      }
+    ]
+  }
+}

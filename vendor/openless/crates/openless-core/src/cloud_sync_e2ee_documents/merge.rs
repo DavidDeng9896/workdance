@@ -1,0 +1,608 @@
+//! Three-way logical merge. Timestamps never choose a winning value.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::cloud_sync_e2ee_protocol::types::{
+    DocumentKind, DocumentSet, LogicalDocument, Revision, Tombstone,
+};
+
+use super::types::*;
+use super::validate::{normalize_merged_collection_order, timestamp, validate_sync_documents};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictReason {
+    BothModified,
+    DeleteModify,
+    NoCommonBaseline,
+}
+
+/// No local/cloud values, value hashes, excerpts, channel names, or secret lengths reach UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedConflict {
+    pub conflict_id: String,
+    pub document_id: String,
+    pub kind: DocumentKind,
+    pub reason: ConflictReason,
+    pub is_credential_unit: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictSide {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConflictChoice {
+    pub conflict_id: String,
+    pub side: ConflictSide,
+}
+
+#[derive(Clone, PartialEq)]
+enum Entry {
+    Live(LogicalDocument),
+    Deleted(Tombstone),
+}
+
+type Unit = BTreeMap<DocumentKey, Entry>;
+type UnitMap = BTreeMap<DocumentKey, Unit>;
+
+pub struct MergePreview {
+    source: DocumentSet,
+    revision: Revision,
+    accepted: UnitMap,
+    unresolved: BTreeMap<String, (DocumentKey, Option<Unit>, Option<Unit>)>,
+    conflicts: Vec<RedactedConflict>,
+    active_choices: BTreeMap<SyncNamespace, Option<String>>,
+    active_conflicts: BTreeMap<String, (SyncNamespace, Option<String>, Option<String>)>,
+    agreed_tie_order: BTreeMap<DocumentKind, Option<BTreeMap<String, usize>>>,
+    replace_local_units: Option<UnitMap>,
+}
+
+impl fmt::Debug for MergePreview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MergePreview([REDACTED])")
+    }
+}
+
+impl MergePreview {
+    pub fn conflicts(&self) -> &[RedactedConflict] {
+        &self.conflicts
+    }
+
+    pub fn resolve(mut self, choices: &[ConflictChoice]) -> DocumentResult<ValidatedSyncDocuments> {
+        let mut selected = BTreeMap::new();
+        for choice in choices {
+            if selected
+                .insert(choice.conflict_id.clone(), choice.side)
+                .is_some()
+            {
+                return Err(DocumentError::ConflictChoiceRequired);
+            }
+        }
+        if selected.keys().collect::<BTreeSet<_>>()
+            != self
+                .unresolved
+                .keys()
+                .chain(self.active_conflicts.keys())
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(DocumentError::ConflictChoiceRequired);
+        }
+        for (id, (key, local, remote)) in std::mem::take(&mut self.unresolved) {
+            let chosen = match selected[&id] {
+                ConflictSide::Local => local.clone(),
+                ConflictSide::Remote => remote.clone(),
+            };
+            if let Some(mut unit) = chosen {
+                keep_highest_hits(&mut unit, [local.as_ref(), remote.as_ref()]);
+                self.accepted.insert(key, unit);
+            }
+        }
+        for (id, (namespace, local, remote)) in std::mem::take(&mut self.active_conflicts) {
+            if selected[&id] == ConflictSide::Local {
+                if let (Some(units), Some(channel_id)) = (&self.replace_local_units, &local) {
+                    let key = DocumentKey {
+                        kind: DocumentKind::Channels,
+                        id: format!("{}:{channel_id}", namespace.as_str()),
+                    };
+                    if let Some(unit) = units.get(&key) {
+                        self.accepted.entry(key).or_insert_with(|| unit.clone());
+                    }
+                }
+            }
+            self.active_choices.insert(
+                namespace,
+                match selected[&id] {
+                    ConflictSide::Local => local,
+                    ConflictSide::Remote => remote,
+                },
+            );
+        }
+        self.source.documents.clear();
+        self.source.tombstones.clear();
+        for unit in self.accepted.values() {
+            for entry in unit.values() {
+                match entry {
+                    Entry::Live(doc) => self.source.documents.push(doc.clone()),
+                    Entry::Deleted(tombstone) => self.source.tombstones.push(tombstone.clone()),
+                }
+            }
+        }
+        for (namespace, choice) in &self.active_choices {
+            let mut found = choice.is_none();
+            for doc in self
+                .source
+                .documents
+                .iter_mut()
+                .filter(|doc| doc.kind == DocumentKind::Channels)
+            {
+                let mut channel: ChannelRecord = serde_json::from_value(doc.value.clone())
+                    .map_err(|_| DocumentError::InvalidDocument)?;
+                if channel.namespace == *namespace {
+                    let desired_active = choice.as_deref() == Some(channel.id.as_str());
+                    if desired_active {
+                        found = true;
+                    }
+                    if channel.active != desired_active {
+                        channel.active = desired_active;
+                        if desired_active {
+                            channel.enabled = true;
+                        }
+                        doc.value = serde_json::to_value(channel)
+                            .map_err(|_| DocumentError::InvalidDocument)?;
+                    }
+                }
+            }
+            if !found {
+                return Err(DocumentError::ConflictChoiceRequired);
+            }
+        }
+        normalize_merged_collection_order(&mut self.source, &self.agreed_tie_order)?;
+        validate_sync_documents(self.source, self.revision)
+    }
+}
+
+/// Different settings/record IDs merge independently; a channel and all its credentials do not.
+pub fn diff_sync_documents(
+    baseline: Option<&ValidatedSyncDocuments>,
+    local: &ValidatedSyncDocuments,
+    remote: &ValidatedSyncDocuments,
+) -> DocumentResult<MergePreview> {
+    let base = baseline.map(|set| units(&set.set));
+    let left = units(&local.set);
+    let right = units(&remote.set);
+    let agreed_tie_order = [
+        DocumentKind::Dictionary,
+        DocumentKind::Corrections,
+        DocumentKind::History,
+    ]
+    .into_iter()
+    .map(|kind| (kind, agreed_collection_order(&local.set, &remote.set, kind)))
+    .collect();
+    let keys: BTreeSet<_> = base
+        .iter()
+        .flat_map(|map| map.keys())
+        .chain(left.keys())
+        .chain(right.keys())
+        .cloned()
+        .collect();
+    let mut preview = MergePreview {
+        source: local.set.clone(),
+        revision: local.revision.max(remote.revision),
+        accepted: BTreeMap::new(),
+        unresolved: BTreeMap::new(),
+        conflicts: Vec::new(),
+        active_choices: BTreeMap::new(),
+        active_conflicts: BTreeMap::new(),
+        agreed_tie_order,
+        replace_local_units: None,
+    };
+    for key in keys {
+        let ancestor = base.as_ref().and_then(|map| map.get(&key));
+        let local_unit = left.get(&key);
+        let remote_unit = right.get(&key);
+        // v1 never garbage-collects tombstones. A missing baseline identity is not a delete.
+        if ancestor.is_some() && (local_unit.is_none() || remote_unit.is_none()) {
+            return Err(DocumentError::MissingTombstone);
+        }
+        let chosen = if equivalent(local_unit, remote_unit) {
+            Some(prefer_tombstone_revision(local_unit, remote_unit))
+        } else if baseline.is_none() {
+            if local_unit.is_none() {
+                Some(remote_unit.cloned())
+            } else if remote_unit.is_none() {
+                Some(local_unit.cloned())
+            } else {
+                None
+            }
+        } else if is_deleted(ancestor) && (has_live(local_unit) || has_live(remote_unit)) {
+            // A stale device cannot revive a deletion already present in the common baseline.
+            None
+        } else if equivalent(local_unit, ancestor) {
+            Some(remote_unit.cloned())
+        } else if equivalent(remote_unit, ancestor) {
+            Some(local_unit.cloned())
+        } else {
+            None
+        };
+        if let Some(chosen) = chosen {
+            if let Some(mut unit) = chosen {
+                keep_highest_hits(&mut unit, [local_unit, remote_unit]);
+                preview.accepted.insert(key, unit);
+            }
+            continue;
+        }
+        let conflict_id = conflict_id(&key);
+        let reason = if is_deleted(local_unit) || is_deleted(remote_unit) || is_deleted(ancestor) {
+            ConflictReason::DeleteModify
+        } else if baseline.is_none() {
+            ConflictReason::NoCommonBaseline
+        } else {
+            ConflictReason::BothModified
+        };
+        preview.conflicts.push(RedactedConflict {
+            conflict_id: conflict_id.clone(),
+            document_id: key.id.clone(),
+            kind: key.kind,
+            reason,
+            is_credential_unit: key.kind == DocumentKind::Channels,
+        });
+        preview.unresolved.insert(
+            conflict_id,
+            (key, local_unit.cloned(), remote_unit.cloned()),
+        );
+    }
+    for namespace in [SyncNamespace::Asr, SyncNamespace::Llm, SyncNamespace::Omni] {
+        let local_active = active_channel(&local.set, namespace)?;
+        let remote_active = active_channel(&remote.set, namespace)?;
+        let base_active = baseline
+            .map(|set| active_channel(&set.set, namespace))
+            .transpose()?
+            .flatten();
+        let chosen = if local_active == remote_active {
+            Some(local_active.clone())
+        } else if baseline.is_some() && local_active == base_active {
+            Some(remote_active.clone())
+        } else if baseline.is_some() && remote_active == base_active {
+            Some(local_active.clone())
+        } else if baseline.is_none() && local_active.is_none() {
+            Some(remote_active.clone())
+        } else if baseline.is_none() && remote_active.is_none() {
+            Some(local_active.clone())
+        } else {
+            None
+        };
+        if let Some(chosen) = chosen {
+            preview.active_choices.insert(namespace, chosen);
+        } else {
+            let id = format!(
+                "active-selection-{}",
+                match namespace {
+                    SyncNamespace::Asr => "asr",
+                    SyncNamespace::Llm => "llm",
+                    SyncNamespace::Omni => "omni",
+                }
+            );
+            let conflict_id = conflict_id(&DocumentKey {
+                kind: DocumentKind::Channels,
+                id: id.clone(),
+            });
+            preview.conflicts.push(RedactedConflict {
+                conflict_id: conflict_id.clone(),
+                document_id: id,
+                kind: DocumentKind::Channels,
+                reason: if baseline.is_some() {
+                    ConflictReason::BothModified
+                } else {
+                    ConflictReason::NoCommonBaseline
+                },
+                is_credential_unit: true,
+            });
+            preview
+                .active_conflicts
+                .insert(conflict_id, (namespace, local_active, remote_active));
+        }
+    }
+    Ok(preview)
+}
+
+/// Local Replace removes receiver-only units, but still honors every explicit choice.
+pub fn diff_local_replace_documents(
+    local: &ValidatedSyncDocuments,
+    incoming: &ValidatedSyncDocuments,
+) -> DocumentResult<MergePreview> {
+    let mut preview = diff_sync_documents(None, local, incoming)?;
+    let incoming_units = units(&incoming.set);
+    preview
+        .accepted
+        .retain(|key, _| incoming_units.contains_key(key));
+    for namespace in [SyncNamespace::Asr, SyncNamespace::Llm, SyncNamespace::Omni] {
+        if active_channel(&incoming.set, namespace)?.is_none() {
+            preview.active_choices.insert(namespace, None);
+        }
+    }
+    preview.replace_local_units = Some(units(&local.set));
+    Ok(preview)
+}
+
+fn active_channel(set: &DocumentSet, namespace: SyncNamespace) -> DocumentResult<Option<String>> {
+    for doc in set
+        .documents
+        .iter()
+        .filter(|doc| doc.kind == DocumentKind::Channels)
+    {
+        let channel: ChannelRecord = serde_json::from_value(doc.value.clone())
+            .map_err(|_| DocumentError::InvalidDocument)?;
+        if channel.namespace == namespace && channel.active {
+            return Ok(Some(channel.id));
+        }
+    }
+    Ok(None)
+}
+
+fn units(set: &DocumentSet) -> UnitMap {
+    let mut result: UnitMap = BTreeMap::new();
+    for doc in &set.documents {
+        let key = DocumentKey {
+            kind: doc.kind,
+            id: doc.id.clone(),
+        };
+        result
+            .entry(unit_key(&key))
+            .or_default()
+            .insert(key, Entry::Live(doc.clone()));
+    }
+    for tombstone in &set.tombstones {
+        let key = DocumentKey {
+            kind: tombstone.kind,
+            id: tombstone.id.clone(),
+        };
+        result
+            .entry(unit_key(&key))
+            .or_default()
+            .insert(key, Entry::Deleted(tombstone.clone()));
+    }
+    result
+}
+
+fn collection_order(set: &DocumentSet, kind: DocumentKind) -> Vec<String> {
+    let mut documents: Vec<_> = set
+        .documents
+        .iter()
+        .filter(|doc| doc.kind == kind)
+        .collect();
+    documents.sort_by_key(|doc| {
+        doc.value
+            .get("sortIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
+    documents.into_iter().map(|doc| doc.id.clone()).collect()
+}
+
+fn agreed_collection_order(
+    local: &DocumentSet,
+    remote: &DocumentSet,
+    kind: DocumentKind,
+) -> Option<BTreeMap<String, usize>> {
+    let local_order = collection_order(local, kind);
+    let remote_order = collection_order(remote, kind);
+    let remote_ids: BTreeSet<_> = remote_order.iter().collect();
+    let local_common: Vec<_> = local_order
+        .iter()
+        .filter(|id| remote_ids.contains(id))
+        .cloned()
+        .collect();
+    let local_ids: BTreeSet<_> = local_order.iter().collect();
+    let remote_common: Vec<_> = remote_order
+        .iter()
+        .filter(|id| local_ids.contains(id))
+        .cloned()
+        .collect();
+    if local_common != remote_common {
+        return None;
+    }
+    let mut order = Vec::new();
+    let (mut local_start, mut remote_start) = (0, 0);
+    // Shared anchors keep one-sided inserts in place; gap order must not depend on the device.
+    for anchor in local_common.iter().map(Some).chain(std::iter::once(None)) {
+        let local_end = anchor.map_or(local_order.len(), |anchor| {
+            local_start
+                + local_order[local_start..]
+                    .iter()
+                    .position(|id| id == anchor)
+                    .expect("shared anchor exists in local collection")
+        });
+        let remote_end = anchor.map_or(remote_order.len(), |anchor| {
+            remote_start
+                + remote_order[remote_start..]
+                    .iter()
+                    .position(|id| id == anchor)
+                    .expect("shared anchor exists in remote collection")
+        });
+        let local_gap = &local_order[local_start..local_end];
+        let remote_gap = &remote_order[remote_start..remote_end];
+        let (first, second) = if local_gap <= remote_gap {
+            (local_gap, remote_gap)
+        } else {
+            (remote_gap, local_gap)
+        };
+        order.extend(first.iter().chain(second).cloned());
+        if let Some(anchor) = anchor {
+            order.push(anchor.clone());
+            local_start = local_end + 1;
+            remote_start = remote_end + 1;
+        }
+    }
+    if order.is_empty() {
+        return None;
+    }
+    Some(
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect(),
+    )
+}
+
+fn unit_key(key: &DocumentKey) -> DocumentKey {
+    DocumentKey {
+        kind: if key.kind == DocumentKind::ProviderCredentials {
+            DocumentKind::Channels
+        } else {
+            key.kind
+        },
+        id: key.id.clone(),
+    }
+}
+
+/// Fields that record how one device listed or used a record, not what the record says.
+/// They never make two copies differ: validation re-derives `sortIndex` from the record
+/// itself, and `keep_highest_hits` reconciles the dictionary hit counter. Comparing them
+/// would turn ordinary use on two devices into a conflict on every shared record.
+fn usage_fields(kind: DocumentKind) -> &'static [&'static str] {
+    match kind {
+        DocumentKind::Dictionary => &["sortIndex", "hits"],
+        DocumentKind::Corrections | DocumentKind::History => &["sortIndex"],
+        _ => &[],
+    }
+}
+
+fn same_content(left: &LogicalDocument, right: &LogicalDocument) -> bool {
+    let fields = usage_fields(left.kind);
+    if fields.is_empty() {
+        return left == right;
+    }
+    let content = |doc: &LogicalDocument| {
+        let mut value = doc.value.clone();
+        if let Some(object) = value.as_object_mut() {
+            for field in fields {
+                object.remove(*field);
+            }
+        }
+        value
+    };
+    left.id == right.id
+        && left.kind == right.kind
+        && left.schema_version == right.schema_version
+        && content(left) == content(right)
+}
+
+/// A hit counter only grows, on whichever device used the word, so the larger copy is the
+/// better record of use. Neither side's count is a change the user has to pick between.
+fn keep_highest_hits(unit: &mut Unit, sides: [Option<&Unit>; 2]) {
+    for (key, entry) in unit.iter_mut() {
+        let Entry::Live(doc) = entry else { continue };
+        if doc.kind != DocumentKind::Dictionary {
+            continue;
+        }
+        let hits = |doc: &LogicalDocument| doc.value.get("hits").and_then(Value::as_u64);
+        let highest = sides
+            .iter()
+            .flatten()
+            .filter_map(|side| match side.get(key) {
+                Some(Entry::Live(other)) => hits(other),
+                _ => None,
+            })
+            .max();
+        if let Some(highest) = highest.filter(|highest| hits(doc) < Some(*highest)) {
+            if let Some(object) = doc.value.as_object_mut() {
+                object.insert("hits".into(), Value::from(highest));
+            }
+        }
+    }
+}
+
+fn equivalent(left: Option<&Unit>, right: Option<&Unit>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter()
+                .all(|(key, value)| match (value, right.get(key)) {
+                    (Entry::Deleted(_), Some(Entry::Deleted(_))) => true,
+                    (Entry::Live(doc), Some(Entry::Live(other))) => same_content(doc, other),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+fn prefer_tombstone_revision(left: Option<&Unit>, right: Option<&Unit>) -> Option<Unit> {
+    let mut selected = left?.clone();
+    if let Some(right) = right {
+        for (key, entry) in right {
+            if let (Entry::Deleted(candidate), Some(Entry::Deleted(current))) =
+                (entry, selected.get(key))
+            {
+                if candidate.base_revision > current.base_revision {
+                    selected.insert(key.clone(), entry.clone());
+                }
+            }
+        }
+    }
+    Some(selected)
+}
+
+fn is_deleted(unit: Option<&Unit>) -> bool {
+    unit.is_some_and(|unit| {
+        unit.values()
+            .any(|entry| matches!(entry, Entry::Deleted(_)))
+    })
+}
+fn has_live(unit: Option<&Unit>) -> bool {
+    unit.is_some_and(|unit| unit.values().any(|entry| matches!(entry, Entry::Live(_))))
+}
+
+fn conflict_id(key: &DocumentKey) -> String {
+    let identity = serde_json::to_vec(key).expect("fixed conflict identity serializes");
+    format!("{:x}", Sha256::digest(identity))
+}
+
+/// Materialize explicit local deletes relative to the last accepted baseline; keep all old marks.
+/// Call after a coherent capture, never use a remote snapshot as the local deletion baseline.
+pub fn record_missing_tombstones(
+    mut current: DocumentSet,
+    baseline: &ValidatedSyncDocuments,
+    deleted_at: &str,
+) -> DocumentResult<ValidatedSyncDocuments> {
+    timestamp(deleted_at)?;
+    let mut live: BTreeSet<_> = current
+        .documents
+        .iter()
+        .map(|doc| (doc.kind, doc.id.clone()))
+        .collect();
+    live.extend(
+        current
+            .tombstones
+            .iter()
+            .map(|doc| (doc.kind, doc.id.clone())),
+    );
+    for old in &baseline.set.tombstones {
+        if live.insert((old.kind, old.id.clone())) {
+            current.tombstones.push(old.clone());
+        }
+    }
+    for old in &baseline.set.documents {
+        if live.insert((old.kind, old.id.clone())) {
+            current.tombstones.push(Tombstone {
+                id: old.id.clone(),
+                kind: old.kind,
+                deleted_at: deleted_at.into(),
+                base_revision: baseline.revision,
+            });
+        }
+    }
+    validate_sync_documents(current, baseline.revision)
+}

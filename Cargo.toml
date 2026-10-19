@@ -4,12 +4,19 @@ members = [
   "crates/workdance-core",
   "crates/workdance-vision",
   "crates/workdance-input",
+  "crates/workdance-gesture",
   "apps/desktop/src-tauri",
 ]
+exclude = [
+  "vendor/openless/src-tauri",
+  "vendor/openless/src-tauri/backend-tests",
+]
+
 default-members = [
   "crates/workdance-core",
   "crates/workdance-vision",
   "crates/workdance-input",
+  "crates/workdance-gesture",
   "apps/desktop/src-tauri",
 ]
 
@@ -24,6 +31,7 @@ repository = "https://github.com/DavidDeng9896/workdance"
 workdance-core = { path = "crates/workdance-core" }
 workdance-vision = { path = "crates/workdance-vision" }
 workdance-input = { path = "crates/workdance-input" }
+workdance-gesture = { path = "crates/workdance-gesture" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

@@ -5661,6 +5661,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "workdance-gesture"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "libloading 0.8.9",
+ "nokhwa",
+ "parking_lot",
+ "serde",
+]
+
+[[package]]
 name = "workdance-input"
 version = "0.1.0"
 dependencies = [

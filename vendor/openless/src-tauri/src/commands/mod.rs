@@ -1,0 +1,981 @@
+//! Tauri IPC 命令入口，按设置、凭据、历史等领域拆分子模块。
+//!
+//! Submodule commands and their macro-generated companions are glob
+//! re-exported for registration by `lib.rs`'s `generate_handler!` as
+//! `commands::<name>`. Platform conditions must stay consistent with the
+//! registration list.
+
+use std::sync::Arc;
+
+#[cfg(not(mobile))]
+use parking_lot::Mutex;
+#[cfg(not(mobile))]
+use tauri::Manager;
+use tauri::State;
+
+// Submodules access the shared Host state, DTOs, and dependency types via use super::*.
+pub(crate) use serde::Serialize;
+pub(crate) use serde_json::Value;
+pub(crate) use tauri::{AppHandle, Emitter, Window};
+
+#[cfg(not(mobile))]
+pub(crate) use crate::asr::local::foundry::PROVIDER_ID as FOUNDRY_LOCAL_PROVIDER_ID;
+#[cfg(not(mobile))]
+pub(crate) use crate::asr::local::{FoundryLocalRuntime, SherpaOnnxRuntime};
+pub(crate) use crate::coordinator::Coordinator;
+pub(crate) use crate::net;
+pub(crate) use crate::permissions::PermissionStatus;
+pub(crate) use crate::persistence::{
+    sync_style_pack_preferences, ChannelKind, CredentialAccount, CredentialsSnapshot,
+    CredentialsVault, PreferencesStore,
+};
+pub(crate) use crate::polish::{
+    http_client_builder, openai_compatible_temperature_for_provider, CodexOAuthConfig,
+    CodexOAuthCredentials, CodexOAuthLLMProvider, LLMError, OpenAICompatibleConfig,
+    OpenAICompatibleLLMProvider, CODEX_DEFAULT_MODEL, CODEX_OAUTH_PROVIDER_ID,
+};
+#[cfg(not(mobile))]
+pub(crate) use crate::recorder::{AudioConsumer, Recorder};
+#[cfg(not(mobile))]
+pub(crate) use crate::types::WindowsImeStatus;
+pub(crate) use crate::types::{
+    builtin_style_pack_id, default_active_style_pack_id, ActivityDay,
+    AndroidAccessibilityRecoveryOutcome, AndroidAccessibilityRecoveryResult,
+    AndroidAccessibilityStatus, AndroidOverlayStatus, AndroidShizukuStatus,
+    ChineseScriptPreference, ComboBinding, CorrectionRule, CredentialsStatus, DictationSession,
+    DictionaryEntry, HotkeyCapability, HotkeyStatus, OutputLanguagePreference, PolishMode,
+    ShortcutBinding, StylePack, StylePackHotkey, StylePackKind, StylePackRuntimeDiagnostics,
+    StyleSystemPrompts, UpdateChannel, UserPreferences, VocabPresetStore,
+};
+
+mod channels;
+mod cloud_sync;
+mod cloud_sync_e2ee;
+mod credentials;
+mod dictation;
+mod dictionary;
+#[cfg(not(mobile))]
+mod experimental_asr;
+#[cfg(not(mobile))]
+mod foundry_asr;
+mod github_oauth;
+mod history;
+mod hotkeys;
+// Local ASR commands also exist on arm64 Android, which links sherpa-onnx
+// (build.rs `local_asr_sherpa`).
+#[cfg(any(not(mobile), local_asr_sherpa))]
+mod local_asr;
+mod marketplace;
+mod misc;
+mod permissions_cmds;
+mod providers;
+mod qa;
+#[cfg(not(mobile))]
+mod remote_input;
+#[cfg(all(not(mobile), debug_assertions))]
+mod selection_polish;
+#[cfg(not(mobile))]
+mod selection_polish_preview;
+#[cfg(all(not(mobile), target_os = "windows"))]
+mod selection_voice;
+mod settings;
+#[cfg(any(not(mobile), local_asr_sherpa))]
+mod sherpa_asr;
+mod style_packs;
+mod voice_edit;
+#[cfg(not(mobile))]
+mod workdance;
+
+pub use channels::*;
+pub use cloud_sync::*;
+pub use cloud_sync_e2ee::*;
+pub use credentials::*;
+pub use dictation::*;
+pub use dictionary::*;
+#[cfg(not(mobile))]
+pub use experimental_asr::*;
+#[cfg(not(mobile))]
+pub use foundry_asr::*;
+pub use github_oauth::*;
+pub use history::*;
+pub use hotkeys::*;
+#[cfg(any(not(mobile), local_asr_sherpa))]
+pub use local_asr::*;
+pub use marketplace::*;
+pub use misc::*;
+pub use permissions_cmds::*;
+pub use providers::*;
+pub use qa::*;
+#[cfg(not(mobile))]
+pub use remote_input::*;
+#[cfg(all(not(mobile), debug_assertions))]
+pub use selection_polish::*;
+#[cfg(not(mobile))]
+pub use selection_polish_preview::*;
+#[cfg(all(not(mobile), target_os = "windows"))]
+pub use selection_voice::*;
+pub use settings::*;
+#[cfg(any(not(mobile), local_asr_sherpa))]
+// Sherpa commands are registered on Windows and arm64 Android; other desktop
+// targets keep an empty re-export.
+#[allow(unused_imports)]
+pub use sherpa_asr::*;
+pub use style_packs::*;
+pub use voice_edit::*;
+#[cfg(not(mobile))]
+pub use workdance::*;
+
+pub(crate) type CoordinatorState<'a> = State<'a, Arc<Coordinator>>;
+pub(crate) type CoreState<'a> = State<'a, Arc<openless_core::OpenLessBackend>>;
+#[cfg(not(mobile))]
+pub struct MicrophoneMonitorState {
+    pub(crate) operation: Mutex<()>,
+    pub(crate) recorder: Mutex<Option<Recorder>>,
+}
+
+#[cfg(not(mobile))]
+impl MicrophoneMonitorState {
+    pub(crate) fn new(recorder: Option<Recorder>) -> Self {
+        Self {
+            operation: Mutex::new(()),
+            recorder: Mutex::new(recorder),
+        }
+    }
+}
+#[cfg(not(mobile))]
+pub type TrayMicrophoneMenuState = Mutex<Vec<TrayMicrophoneMenuItem>>;
+
+#[cfg(not(mobile))]
+pub struct TrayMicrophoneMenuItem {
+    pub id: String,
+    pub device_name: String,
+    pub item: tauri::menu::CheckMenuItem<tauri::Wry>,
+}
+
+#[cfg(not(mobile))]
+pub fn sync_tray_microphone_selection(items: &[TrayMicrophoneMenuItem], device_name: &str) {
+    for item in items {
+        let _ = item.item.set_checked(item.device_name == device_name);
+    }
+}
+
+#[cfg(not(mobile))]
+pub(crate) struct LevelProbeConsumer;
+
+#[cfg(not(mobile))]
+impl AudioConsumer for LevelProbeConsumer {
+    fn consume_pcm_chunk(&self, _pcm: &[u8]) {}
+}
+
+// ─────────────────────────── shared cross-domain validation helpers ───────────────────────────
+
+/// UUID-v4 literal validation: 36 chars + 4 `-` separators (8-4-4-4-12) +
+/// ASCII hex only.
+/// Used by install/detail/like — pack_id comes from the remote server and must
+/// be a UUID it issued.
+pub(crate) fn is_valid_session_id(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        let is_dash_position = matches!(i, 8 | 13 | 18 | 23);
+        if is_dash_position {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Local style pack id whitelist: `[A-Za-z0-9._-]`, length 1..=128.
+/// Uploads use local ids (`builtin.light` / a user-chosen slug / a UUID are
+/// all fine), not remote UUIDs.
+/// Still blocks `..` / `/` / `\` / control characters to keep path traversal
+/// out of temp zip file names.
+pub(crate) fn is_valid_local_pack_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+}
+
+// ─── Open a path in the system file manager (shared by the three ASR modules, cfg per platform) ───
+
+#[cfg(target_os = "windows")]
+pub(crate) fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let operation = wide_null("open");
+    let target = wide_null(&path.display().to_string());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err(format!("ShellExecuteW failed: {}", result.0 as isize))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+pub(crate) fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Model folders live in app-private storage on Android, which no file
+/// manager can open; the local ASR "reveal" commands report that instead.
+#[cfg(all(target_os = "android", local_asr_sherpa))]
+pub(crate) fn open_path_in_file_manager(_path: &std::path::Path) -> Result<(), String> {
+    Err("Opening the model folder is not supported on Android".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_local_pack_id, is_valid_session_id};
+    use crate::commands::credentials::{
+        asr_configured_for_provider, llm_configured_for_provider,
+        local_asr_release_plan_for_provider, release_foundry_runtime_if_inactive,
+        release_sherpa_runtime_if_inactive,
+    };
+    use crate::commands::foundry_asr::{
+        active_foundry_model_from_prefs, normalize_foundry_language_hint,
+        validate_foundry_model_alias,
+    };
+    use crate::commands::settings::parse_latest_beta_from_atom;
+    use crate::commands::sherpa_asr::{
+        active_sherpa_model_from_prefs, normalize_sherpa_language_hint, validate_sherpa_model_alias,
+    };
+    use crate::persistence::CredentialsSnapshot;
+    use crate::types::{
+        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, ShortcutBinding, UserPreferences,
+    };
+
+    fn snapshot() -> CredentialsSnapshot {
+        CredentialsSnapshot::default()
+    }
+
+    #[test]
+    fn credentials_status_follows_active_asr_provider_requirements() {
+        let volcengine = CredentialsSnapshot {
+            volcengine_app_key: Some("app".into()),
+            volcengine_access_key: Some("access".into()),
+            volcengine_resource_id: Some("resource".into()),
+            volcengine_auth_mode: None, // defaults to AppIdToken mode
+            ..snapshot()
+        };
+        assert!(asr_configured_for_provider("volcengine", &volcengine));
+
+        // AppIdToken mode without access_key -> unconfigured (even with
+        // app_key / resource_id filled).
+        let volcengine_no_access = CredentialsSnapshot {
+            volcengine_app_key: Some("app".into()),
+            volcengine_resource_id: Some("resource".into()),
+            ..snapshot()
+        };
+        assert!(!asr_configured_for_provider(
+            "volcengine",
+            &volcengine_no_access
+        ));
+
+        // ApiKey mode: only the standalone api_key slot + resource_id are
+        // needed, no app_key.
+        let volcengine_api_key = CredentialsSnapshot {
+            volcengine_api_key: Some("key".into()),
+            volcengine_resource_id: Some("resource".into()),
+            volcengine_auth_mode: Some("api_key".into()),
+            ..snapshot()
+        };
+        assert!(asr_configured_for_provider(
+            "volcengine",
+            &volcengine_api_key
+        ));
+        // ApiKey mode missing api_key (even with the old access_key slot set) ->
+        // unconfigured.
+        let volcengine_api_key_missing = CredentialsSnapshot {
+            volcengine_access_key: Some("old-access-token".into()),
+            volcengine_resource_id: Some("resource".into()),
+            volcengine_auth_mode: Some("api_key".into()),
+            ..snapshot()
+        };
+        assert!(!asr_configured_for_provider(
+            "volcengine",
+            &volcengine_api_key_missing
+        ));
+
+        let whisper_key_only = CredentialsSnapshot {
+            asr_api_key: Some("key".into()),
+            ..snapshot()
+        };
+        // endpoint/model defaults now come from the Core descriptor, so the
+        // public Whisper channel counts as configured with just the required
+        // key.
+        assert!(asr_configured_for_provider("whisper", &whisper_key_only));
+        assert!(asr_configured_for_provider(
+            crate::asr::bailian::PROVIDER_ID,
+            &whisper_key_only
+        ));
+
+        let whisper_keyless_ready = CredentialsSnapshot {
+            asr_endpoint: Some("https://api.openai.com/v1".into()),
+            asr_model: Some("whisper-1".into()),
+            ..snapshot()
+        };
+        // An explicit endpoint/model does not waive the public Whisper
+        // provider's key; only `openai-compatible` allows optional auth.
+        assert!(!asr_configured_for_provider(
+            "whisper",
+            &whisper_keyless_ready
+        ));
+        assert!(!asr_configured_for_provider(
+            crate::asr::bailian::PROVIDER_ID,
+            &whisper_keyless_ready
+        ));
+
+        // Retired metadata IDs can never count as a configured native runtime.
+        for provider in [
+            crate::asr::local::PROVIDER_ID,
+            crate::asr::local::LOCAL_QWEN3_C_PROVIDER_ID,
+            crate::asr::local::LOCAL_QWEN3_MLX_PROVIDER_ID,
+        ] {
+            assert!(!asr_configured_for_provider(provider, &snapshot()));
+        }
+        #[cfg(target_os = "macos")]
+        for provider in ["local-whisper", "apple-whisper"] {
+            assert!(!asr_configured_for_provider(provider, &snapshot()));
+        }
+        // System recognition needs no cloud credential, but only the macOS
+        // host registers its native engine. Retired models remain unavailable.
+        assert_eq!(
+            asr_configured_for_provider("apple-speech", &snapshot()),
+            cfg!(target_os = "macos")
+        );
+        #[cfg(target_os = "windows")]
+        assert!(asr_configured_for_provider(
+            crate::asr::local::foundry::PROVIDER_ID,
+            &snapshot()
+        ));
+        #[cfg(target_os = "windows")]
+        assert!(asr_configured_for_provider(
+            crate::asr::local::sherpa::PROVIDER_ID,
+            &snapshot()
+        ));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!asr_configured_for_provider(
+            crate::asr::local::foundry::PROVIDER_ID,
+            &snapshot()
+        ));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!asr_configured_for_provider(
+            crate::asr::local::sherpa::PROVIDER_ID,
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn credentials_status_treats_foundry_local_asr_as_configured() {
+        #[cfg(target_os = "windows")]
+        {
+            assert!(asr_configured_for_provider(
+                crate::asr::local::foundry::PROVIDER_ID,
+                &CredentialsSnapshot::default()
+            ));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!asr_configured_for_provider(
+                crate::asr::local::foundry::PROVIDER_ID,
+                &CredentialsSnapshot::default()
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_switch_release_plan_covers_inactive_local_runtimes() {
+        let qwen = local_asr_release_plan_for_provider(crate::asr::local::PROVIDER_ID);
+        assert!(!qwen.qwen);
+        assert!(qwen.whisper);
+        assert!(qwen.foundry);
+        assert!(qwen.sherpa);
+
+        let qwen_c =
+            local_asr_release_plan_for_provider(crate::asr::local::LOCAL_QWEN3_C_PROVIDER_ID);
+        assert!(!qwen_c.qwen);
+        assert!(qwen_c.whisper);
+
+        let whisper =
+            local_asr_release_plan_for_provider(crate::asr::local::LOCAL_WHISPER_PROVIDER_ID);
+        assert!(whisper.qwen);
+        assert!(!whisper.whisper);
+        assert!(whisper.foundry);
+        assert!(whisper.sherpa);
+
+        let foundry = local_asr_release_plan_for_provider(crate::asr::local::foundry::PROVIDER_ID);
+        assert!(foundry.qwen);
+        assert!(foundry.whisper);
+        assert!(!foundry.foundry);
+        assert!(foundry.sherpa);
+
+        let sherpa = local_asr_release_plan_for_provider(crate::asr::local::sherpa::PROVIDER_ID);
+        assert!(sherpa.qwen);
+        assert!(sherpa.whisper);
+        assert!(sherpa.foundry);
+        assert!(!sherpa.sherpa);
+
+        let cloud = local_asr_release_plan_for_provider("volcengine");
+        assert!(cloud.qwen);
+        assert!(cloud.whisper);
+        assert!(cloud.foundry);
+        assert!(cloud.sherpa);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn provider_switch_release_requests_foundry_prepare_cancel_first() {
+        let runtime = std::sync::Arc::new(crate::asr::local::FoundryLocalRuntime::new());
+
+        release_foundry_runtime_if_inactive(&runtime, true).await;
+
+        assert!(runtime.cancel_prepare_requested_for_tests());
+    }
+
+    #[tokio::test]
+    async fn provider_switch_release_requests_sherpa_prepare_cancel_first() {
+        let runtime = std::sync::Arc::new(crate::asr::local::SherpaOnnxRuntime::new());
+
+        release_sherpa_runtime_if_inactive(&runtime, true).await;
+
+        assert!(runtime.cancel_prepare_requested_for_tests());
+        let status = runtime.status_snapshot("sense-voice-small-zh").await;
+        assert!(!status.runtime_ready);
+    }
+
+    #[test]
+    fn foundry_language_hint_accepts_empty_and_lowercase_iso_639_1() {
+        assert_eq!(normalize_foundry_language_hint("").unwrap(), "");
+        assert_eq!(normalize_foundry_language_hint("   ").unwrap(), "");
+        assert_eq!(normalize_foundry_language_hint("zh").unwrap(), "zh");
+        assert_eq!(normalize_foundry_language_hint(" en ").unwrap(), "en");
+    }
+
+    #[test]
+    fn foundry_language_hint_rejects_non_lowercase_iso_639_1() {
+        assert!(normalize_foundry_language_hint("ZH").is_err());
+        assert!(normalize_foundry_language_hint("zho").is_err());
+        assert!(normalize_foundry_language_hint("z1").is_err());
+    }
+
+    #[test]
+    fn foundry_model_alias_validation_rejects_unknown_alias() {
+        assert!(
+            validate_foundry_model_alias(crate::asr::local::foundry::DEFAULT_MODEL_ALIAS).is_ok()
+        );
+        assert!(validate_foundry_model_alias("whisper-medium").is_ok());
+        assert!(validate_foundry_model_alias("whisper-large-v3-turbo").is_ok());
+        assert!(validate_foundry_model_alias("whisper-large").is_err());
+    }
+
+    #[test]
+    fn foundry_active_model_pref_falls_back_to_default_for_unknown_alias() {
+        let prefs = UserPreferences {
+            foundry_local_asr_model: "whisper-large".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            active_foundry_model_from_prefs(&prefs),
+            crate::asr::local::foundry::DEFAULT_MODEL_ALIAS
+        );
+    }
+
+    #[test]
+    fn foundry_active_model_pref_preserves_large_model_aliases() {
+        for alias in ["whisper-medium", "whisper-large-v3-turbo"] {
+            let prefs = UserPreferences {
+                foundry_local_asr_model: alias.to_string(),
+                ..Default::default()
+            };
+
+            assert_eq!(active_foundry_model_from_prefs(&prefs), alias);
+        }
+    }
+
+    #[test]
+    fn sherpa_language_hint_accepts_empty_and_supported_lowercase_tags() {
+        assert_eq!(normalize_sherpa_language_hint("").unwrap(), "");
+        assert_eq!(normalize_sherpa_language_hint("   ").unwrap(), "");
+        assert_eq!(normalize_sherpa_language_hint("zh").unwrap(), "zh");
+        assert_eq!(normalize_sherpa_language_hint(" en ").unwrap(), "en");
+        assert_eq!(normalize_sherpa_language_hint("zh-cn").unwrap(), "zh-cn");
+        assert_eq!(normalize_sherpa_language_hint("yue").unwrap(), "yue");
+    }
+
+    #[test]
+    fn sherpa_language_hint_normalizes_uppercase_and_rejects_digits() {
+        assert_eq!(normalize_sherpa_language_hint("ZH").unwrap(), "zh");
+        assert!(normalize_sherpa_language_hint("zh-1").is_err());
+        assert!(normalize_sherpa_language_hint("zh_CN").is_err());
+    }
+
+    #[test]
+    fn sherpa_model_alias_validation_matches_catalog() {
+        assert!(
+            validate_sherpa_model_alias(crate::asr::local::sherpa::DEFAULT_MODEL_ALIAS).is_ok()
+        );
+        assert!(validate_sherpa_model_alias("qwen3-asr-0.6b-int8").is_ok());
+        assert!(
+            validate_sherpa_model_alias(crate::asr::local::sherpa::DEFAULT_ONLINE_MODEL_ALIAS)
+                .is_ok()
+        );
+        assert!(validate_sherpa_model_alias("zipformer-zh-streaming").is_err());
+    }
+
+    #[test]
+    fn sherpa_active_model_pref_falls_back_to_default_for_unknown_alias() {
+        let prefs = UserPreferences {
+            sherpa_onnx_model: "zipformer-zh-streaming".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            active_sherpa_model_from_prefs(&prefs),
+            crate::asr::local::sherpa::DEFAULT_MODEL_ALIAS
+        );
+    }
+
+    #[test]
+    fn credentials_status_accepts_keyless_custom_llm_only() {
+        let keyless_ready = CredentialsSnapshot {
+            ark_endpoint: Some("http://localhost:11434/v1".into()),
+            ark_model_id: Some("qwen".into()),
+            ..snapshot()
+        };
+        assert!(llm_configured_for_provider("custom", &keyless_ready));
+        assert!(llm_configured_for_provider("self-hosted", &keyless_ready));
+        assert!(llm_configured_for_provider(
+            "openrouterFree",
+            &keyless_ready
+        ));
+
+        let hosted_keyless = CredentialsSnapshot {
+            ark_endpoint: Some("https://openrouter.ai/api/v1".into()),
+            ark_model_id: Some("qwen/qwen3-coder:free".into()),
+            ..snapshot()
+        };
+        assert!(!llm_configured_for_provider(
+            "openrouterFree",
+            &hosted_keyless
+        ));
+
+        let hosted_ready = CredentialsSnapshot {
+            ark_api_key: Some("key".into()),
+            ark_endpoint: Some("https://openrouter.ai/api/v1/chat/completions".into()),
+            ark_model_id: Some("qwen/qwen3-coder:free".into()),
+            ..snapshot()
+        };
+        assert!(llm_configured_for_provider("openrouterFree", &hosted_ready));
+
+        let key_without_endpoint = CredentialsSnapshot {
+            ark_api_key: Some("key".into()),
+            ark_model_id: Some("qwen".into()),
+            ..snapshot()
+        };
+        assert!(!llm_configured_for_provider(
+            "custom",
+            &key_without_endpoint
+        ));
+
+        let endpoint_without_model = CredentialsSnapshot {
+            ark_endpoint: Some("http://localhost:11434/v1".into()),
+            ..snapshot()
+        };
+        assert!(!llm_configured_for_provider(
+            "custom",
+            &endpoint_without_model
+        ));
+    }
+
+    #[test]
+    fn credentials_status_requires_api_key_for_atlascloud() {
+        let keyless = CredentialsSnapshot {
+            ark_endpoint: Some("https://api.atlascloud.ai/v1".into()),
+            ark_model_id: Some("qwen/qwen3.5-flash".into()),
+            ..snapshot()
+        };
+        assert!(!llm_configured_for_provider("atlascloud", &keyless));
+
+        let ready = CredentialsSnapshot {
+            ark_api_key: Some("key".into()),
+            ..keyless
+        };
+        assert!(llm_configured_for_provider("atlascloud", &ready));
+    }
+
+    #[test]
+    fn sync_dictation_hotkey_sets_modifier_trigger_and_clears_combo() {
+        let mut prefs = UserPreferences {
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::Custom,
+                mode: HotkeyMode::Toggle,
+                keys: None,
+            },
+            custom_combo_hotkey: Some(ComboBinding {
+                primary: "D".into(),
+                modifiers: vec!["cmd".into(), "shift".into()],
+            }),
+            dictation_hotkey: ShortcutBinding {
+                primary: "RightControl".into(),
+                modifiers: vec![],
+            },
+            ..Default::default()
+        };
+
+        super::sync_dictation_hotkey_legacy_fields(&mut prefs);
+
+        assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::RightControl);
+        assert!(prefs.custom_combo_hotkey.is_none());
+    }
+
+    #[test]
+    fn sync_dictation_hotkey_sets_custom_trigger_and_combo_binding() {
+        let mut prefs = UserPreferences {
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::RightControl,
+                mode: HotkeyMode::Toggle,
+                keys: None,
+            },
+            dictation_hotkey: ShortcutBinding {
+                primary: "D".into(),
+                modifiers: vec!["cmd".into(), "shift".into()],
+            },
+            ..Default::default()
+        };
+
+        super::sync_dictation_hotkey_legacy_fields(&mut prefs);
+
+        assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::Custom);
+        let combo = prefs.custom_combo_hotkey.expect("combo binding saved");
+        assert_eq!(combo.primary, "D");
+        assert_eq!(
+            combo.modifiers,
+            vec!["cmd".to_string(), "shift".to_string()]
+        );
+    }
+
+    #[test]
+    fn sync_dictation_hotkey_clears_empty_custom_binding() {
+        let mut prefs = UserPreferences {
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::RightControl,
+                mode: HotkeyMode::Toggle,
+                keys: None,
+            },
+            custom_combo_hotkey: Some(ComboBinding {
+                primary: "D".into(),
+                modifiers: vec!["cmd".into(), "shift".into()],
+            }),
+            dictation_hotkey: ShortcutBinding {
+                primary: " ".into(),
+                modifiers: vec!["cmd".into()],
+            },
+            ..Default::default()
+        };
+
+        super::sync_dictation_hotkey_legacy_fields(&mut prefs);
+
+        assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::Custom);
+        assert!(prefs.custom_combo_hotkey.is_none());
+    }
+
+    #[test]
+    fn validate_combo_hotkey_rejects_bare_shift() {
+        let result = super::validate_combo_hotkey(ComboBinding {
+            primary: "Shift".into(),
+            modifiers: vec![],
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn combo_hotkey_bare_shift_rejection_matches_dictation_setter() {
+        let binding = ShortcutBinding {
+            primary: "Shift".into(),
+            modifiers: vec![],
+        };
+
+        assert_eq!(
+            super::reject_bare_shift_dictation_shortcut(&binding),
+            Err("Shift 单键目前只能用于翻译快捷键".into())
+        );
+    }
+
+    #[test]
+    fn dictation_qa_overlap_rejects_same_modifier_only_binding() {
+        let binding = ShortcutBinding {
+            primary: "RightControl".into(),
+            modifiers: vec![],
+        };
+
+        assert_eq!(
+            super::reject_dictation_qa_hotkey_overlap(&binding, &binding),
+            Err("QA 快捷键不能和听写快捷键相同".into())
+        );
+    }
+
+    #[test]
+    fn dictation_qa_overlap_rejects_same_combo_binding() {
+        let dictation = ShortcutBinding {
+            primary: ";".into(),
+            modifiers: vec!["ctrl".into(), "shift".into()],
+        };
+        let qa = ShortcutBinding {
+            primary: ";".into(),
+            modifiers: vec!["control".into(), "shift".into()],
+        };
+
+        assert_eq!(
+            super::reject_dictation_qa_hotkey_overlap(&dictation, &qa),
+            Err("QA 快捷键不能和听写快捷键相同".into())
+        );
+    }
+
+    #[test]
+    fn dictation_qa_overlap_allows_distinct_bindings() {
+        let dictation = ShortcutBinding {
+            primary: "RightControl".into(),
+            modifiers: vec![],
+        };
+        let qa = ShortcutBinding {
+            primary: ";".into(),
+            modifiers: vec!["ctrl".into(), "shift".into()],
+        };
+
+        assert!(super::reject_dictation_qa_hotkey_overlap(&dictation, &qa).is_ok());
+    }
+
+    #[test]
+    fn dictation_translation_overlap_rejects_same_modifier_only_binding() {
+        let binding = ShortcutBinding {
+            primary: "RightControl".into(),
+            modifiers: vec![],
+        };
+
+        assert_eq!(
+            super::reject_dictation_translation_hotkey_overlap(&binding, &binding),
+            Err("翻译快捷键不能和听写快捷键相同".into())
+        );
+    }
+
+    #[test]
+    fn dictation_translation_overlap_rejects_same_combo_binding() {
+        let dictation = ShortcutBinding {
+            primary: "T".into(),
+            modifiers: vec!["ctrl".into(), "shift".into()],
+        };
+        let translation = ShortcutBinding {
+            primary: "T".into(),
+            modifiers: vec!["control".into(), "shift".into()],
+        };
+
+        assert_eq!(
+            super::reject_dictation_translation_hotkey_overlap(&dictation, &translation),
+            Err("翻译快捷键不能和听写快捷键相同".into())
+        );
+    }
+
+    #[test]
+    fn dictation_translation_overlap_allows_distinct_bindings() {
+        let dictation = ShortcutBinding {
+            primary: "RightControl".into(),
+            modifiers: vec![],
+        };
+        let translation = ShortcutBinding {
+            primary: "Shift".into(),
+            modifiers: vec![],
+        };
+
+        assert!(
+            super::reject_dictation_translation_hotkey_overlap(&dictation, &translation).is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_latest_beta_from_atom_picks_first_beta_tagged_entry() {
+        // Fixture trimmed from a real `releases.atom`: one stable + one Beta
+        // entry. Parsing must skip the stable entry (tag not ending in
+        // -beta-tauri) and return the Beta.
+        let body = r#"<?xml version="1.0"?>
+<feed>
+  <entry>
+    <id>tag:github.com,2008:Repository/X/v1.2.23-tauri</id>
+    <updated>2026-05-07T09:05:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.2.23-tauri"/>
+    <title>OpenLess v1.2.23-tauri</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/X/v1.2.24-2-beta-tauri</id>
+    <updated>2026-05-08T01:27:23Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.2.24-2-beta-tauri"/>
+    <title>OpenLess v1.2.24-2-beta-tauri</title>
+  </entry>
+</feed>"#;
+        let got = parse_latest_beta_from_atom(body).expect("must find a Beta entry");
+        assert_eq!(got.tag_name, "v1.2.24-2-beta-tauri");
+        assert_eq!(
+            got.html_url,
+            "https://github.com/Open-Less/openless/releases/tag/v1.2.24-2-beta-tauri"
+        );
+        assert_eq!(got.published_at, "2026-05-08T01:27:23Z");
+    }
+
+    #[test]
+    fn parse_latest_beta_from_atom_prefers_modern_beta_tag_over_legacy_beta() {
+        let body = r#"<?xml version="1.0"?>
+<feed>
+  <entry>
+    <updated>2026-07-15T08:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-tauri"/>
+  </entry>
+  <entry>
+    <updated>2026-07-15T07:00:00Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.1-tauri"/>
+  </entry>
+  <entry>
+    <updated>2026-06-17T15:41:46Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.3.10-4-beta-tauri"/>
+  </entry>
+</feed>"#;
+
+        let got = parse_latest_beta_from_atom(body).expect("must find the newest Beta entry");
+
+        assert_eq!(got.tag_name, "v1.3.15-Beta.1-tauri");
+        assert_eq!(got.published_at, "2026-07-15T07:00:00Z");
+    }
+
+    #[test]
+    fn parse_latest_beta_from_atom_skips_malformed_modern_tags() {
+        let body = r#"<feed>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/garbage-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/1.3.15-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15.0-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1..15-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.x-Beta.1-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.x-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.1-extra-tauri"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.1-tauri-extra"/></entry>
+  <entry><link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.2-Beta.1-tauri"/></entry>
+  <entry>
+    <updated>2026-07-15T07:00:00Z</updated>
+    <link href="https://github.com/Open-Less/openless/releases/tag/v1.3.15-Beta.1-tauri"/>
+  </entry>
+</feed>"#;
+
+        let got = parse_latest_beta_from_atom(body).expect("must skip malformed Beta tags");
+
+        assert_eq!(got.tag_name, "v1.3.15-Beta.1-tauri");
+        assert_eq!(got.published_at, "2026-07-15T07:00:00Z");
+    }
+
+    #[test]
+    fn parse_latest_beta_from_atom_returns_none_when_only_stable_releases() {
+        let body = r#"<feed>
+  <entry>
+    <link rel="alternate" type="text/html" href="https://github.com/Open-Less/openless/releases/tag/v1.2.23-tauri"/>
+    <updated>2026-05-07T09:05:00Z</updated>
+  </entry>
+</feed>"#;
+        assert!(parse_latest_beta_from_atom(body).is_none());
+    }
+
+    #[test]
+    fn is_valid_session_id_accepts_canonical_uuid_v4() {
+        // Canonical UUID-v4 literal: 8-4-4-4-12; lowercase, uppercase, and
+        // mixed all accepted.
+        assert!(is_valid_session_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_session_id("550E8400-E29B-41D4-A716-446655440000"));
+        assert!(is_valid_session_id("Abc12345-6789-abcd-EF01-234567890abc"));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_path_traversal_and_garbage() {
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("../../etc/passwd"));
+        assert!(!is_valid_session_id("..\\..\\windows\\system32"));
+        // Right length but contains `/`: wrong dash positions or non-hex chars
+        // are both rejected
+        assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544/000"));
+        assert!(!is_valid_session_id("550e8400_e29b_41d4_a716_446655440000")); // uses _ for -
+                                                                               // non-hex char
+        assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544000g"));
+        // Wrong length (35 / 37)
+        assert!(!is_valid_session_id("550e8400-e29b-41d4-a716-44665544000"));
+        assert!(!is_valid_session_id(
+            "550e8400-e29b-41d4-a716-4466554400000"
+        ));
+        // NUL byte
+        assert!(!is_valid_session_id(
+            "550e8400-e29b-41d4-a716-44665544\x00000"
+        ));
+        // Percent-encoding and absolute paths
+        assert!(!is_valid_session_id("%2e%2e/recordings/x"));
+        assert!(!is_valid_session_id("/Users/attacker/secret.wav"));
+    }
+
+    #[test]
+    fn is_valid_local_pack_id_accepts_realistic_ids() {
+        assert!(is_valid_local_pack_id("builtin.light"));
+        assert!(is_valid_local_pack_id("builtin.structured"));
+        assert!(is_valid_local_pack_id("custom.meeting"));
+        assert!(is_valid_local_pack_id(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(is_valid_local_pack_id("my_pack_v2"));
+        assert!(is_valid_local_pack_id("Pack-2026.05"));
+    }
+
+    #[test]
+    fn is_valid_local_pack_id_rejects_path_traversal() {
+        assert!(!is_valid_local_pack_id(""));
+        assert!(!is_valid_local_pack_id("../etc/passwd"));
+        assert!(!is_valid_local_pack_id("..\\windows\\system32"));
+        assert!(!is_valid_local_pack_id("pack/../../etc"));
+        assert!(!is_valid_local_pack_id("/abs/path"));
+        assert!(!is_valid_local_pack_id("with space"));
+        assert!(!is_valid_local_pack_id("with\x00null"));
+        assert!(!is_valid_local_pack_id(&"a".repeat(129)));
+    }
+}

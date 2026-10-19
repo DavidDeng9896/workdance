@@ -1,0 +1,21 @@
+[package]
+name = "workdance-gesture"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "WorkDance hand classification and temporal gate for the OpenLess host"
+publish = false
+
+[features]
+default = []
+# nokhwa RGB capture (V4L2 / AVFoundation / MediaFoundation).
+camera = ["dep:nokhwa"]
+# MediaPipe Tasks Hand Landmarker via dlopen. Compiles without the native library.
+mediapipe = ["dep:libloading"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+dirs = "6"
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
+libloading = { version = "0.8", optional = true }

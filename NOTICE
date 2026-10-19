@@ -1,0 +1,10 @@
+WorkDance desktop host includes OpenLess (https://github.com/Open-Less/openless),
+branch beta, under the GNU Affero General Public License v3.0 only.
+
+The full license text is `vendor/openless/UPSTREAM_LICENSE`.
+The pinned upstream commit is `vendor/openless/UPSTREAM_COMMIT`.
+
+`crates/workdance-gesture` is part of that combined application and is
+distributed under AGPL-3.0-only. Older crates under `crates/workdance-*`
+(except `workdance-gesture`) remain the previous MIT shell and are reference
+code, not the shipping host.

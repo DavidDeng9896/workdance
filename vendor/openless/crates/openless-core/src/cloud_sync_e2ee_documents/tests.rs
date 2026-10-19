@@ -1,0 +1,1249 @@
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+use super::*;
+use crate::cloud_sync_e2ee_protocol::types::{
+    DocumentKind, LogicalDocument, Revision, SourceDevice, Tombstone,
+};
+
+pub(super) fn source() -> SourceDevice {
+    SourceDevice {
+        id: "device-a".into(),
+        os: "macos".into(),
+        arch: "aarch64".into(),
+        app_version: "2.0.0-Beta.3".into(),
+    }
+}
+
+pub(super) fn snapshot() -> ExportSnapshot {
+    ExportSnapshot {
+        source_device: source(),
+        exported_at: "2026-09-26T00:00:00Z".into(),
+        generation: Revision::new(7),
+        base_revision: Revision::new(3),
+        preferences: SecretJson::new(json!({"themeMode":"system","showCapsule":true})),
+        ui_preferences: ui_preferences("en", "medium"),
+        channels: Vec::new(),
+        provider_credentials: Vec::new(),
+        dictionary: Vec::new(),
+        vocabulary_presets: Vec::new(),
+        corrections: Vec::new(),
+        style_packs: Vec::new(),
+        history: Vec::new(),
+        activity: Vec::new(),
+        window_positions: Vec::new(),
+        retained_documents: Vec::new(),
+        tombstones: Vec::new(),
+    }
+}
+
+pub(super) fn sample() -> ValidatedSyncDocuments {
+    export_snapshot(snapshot()).unwrap().documents
+}
+
+fn change(
+    set: &ValidatedSyncDocuments,
+    kind: DocumentKind,
+    id: &str,
+    value: Value,
+) -> ValidatedSyncDocuments {
+    let mut set = set.documents().clone();
+    if let Some(doc) = set
+        .documents
+        .iter_mut()
+        .find(|doc| doc.kind == kind && doc.id == id)
+    {
+        doc.value = value;
+    } else {
+        set.documents.push(LogicalDocument {
+            id: id.into(),
+            kind,
+            schema_version: 1,
+            value,
+        });
+    }
+    validate_sync_documents(set, Revision::new(4)).unwrap()
+}
+
+fn dictionary(id: &str, text: &str) -> Value {
+    json!({"id":id,"phrase":text,"note":null,"enabled":true,"hits":0,"createdAt":"2026-09-26T00:00:00Z"})
+}
+
+pub(super) fn channel_snapshot() -> ExportSnapshot {
+    let mut data = snapshot();
+    data.channels.push(ChannelRecord {
+        id: "llm-one".into(),
+        namespace: SyncNamespace::Llm,
+        provider_type: "requesty".into(),
+        name: "original".into(),
+        enabled: true,
+        order: 0,
+        active: true,
+        configuration: BTreeMap::new(),
+    });
+    data.provider_credentials.push(ProviderCredentialRecord {
+        channel_id: "llm-one".into(),
+        namespace: SyncNamespace::Llm,
+        accounts: BTreeMap::from([("ark.api_key".into(), "fixture-secret-original".into())]),
+    });
+    data
+}
+
+#[test]
+fn all_current_preference_fields_have_an_explicit_registration() {
+    let source = include_str!("../shared_types.rs");
+    let fields = source
+        .split("pub struct UserPreferences {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let names: std::collections::BTreeSet<_> = fields
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("pub ")
+                .and_then(|s| s.split_once(':'))
+                .map(|(name, _)| name)
+        })
+        .collect();
+    let registered: std::collections::BTreeSet<_> = registry::PREFERENCE_FIELDS
+        .iter()
+        .map(|field| field.rust_name)
+        .collect();
+    assert_eq!(
+        names, registered,
+        "new persistent fields require a reviewed sync classification"
+    );
+    assert_eq!(registered.len(), registry::PREFERENCE_FIELDS.len());
+}
+
+#[test]
+fn public_endpoint_rejects_credential_like_hostnames() {
+    assert!(!registry::public_credential_value_safe(
+        "ark.endpoint",
+        "https://sk-live-abc123.example.test"
+    ));
+    assert!(!registry::public_credential_value_safe(
+        "ark.endpoint",
+        "https://token.example.test/v1"
+    ));
+    assert!(registry::public_credential_value_safe(
+        "ark.endpoint",
+        "https://api.example.test/v1"
+    ));
+}
+
+#[test]
+fn testing_features_opt_in_is_never_exported_or_accepted_from_another_device() {
+    let mut data = snapshot();
+    data.preferences = SecretJson::new(json!({"testingFeaturesEnabled": true}));
+    let exported = export_snapshot(data).unwrap();
+    assert!(!serde_json::to_string(exported.documents.documents())
+        .unwrap()
+        .contains("testingFeaturesEnabled"));
+    let mut invalid = sample().documents().clone();
+    invalid.documents.push(LogicalDocument {
+        id: "testingFeaturesEnabled".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value: json!(true),
+    });
+    assert_eq!(
+        validate_sync_documents(invalid, Revision::new(3)).unwrap_err(),
+        DocumentError::ExcludedField
+    );
+}
+
+#[test]
+fn controlled_export_keeps_real_service_keys_but_excludes_local_secrets_and_grants() {
+    let mut data = channel_snapshot();
+    data.preferences = SecretJson::new(
+        json!({"themeMode":"dark","remoteInputPin":"fixture-pin-never-export","codingAgentEnabled":true,"cursorContextEnabled":true,"vocabularyLearningEnabled":true,"marketplaceDevLogin":"fixture-login","splashSeenVersion":"2","activeLlmProvider":"llm-one","codingAgentExe":"/fixture/never-run","futureAppearance":{"accent":"violet"}}),
+    );
+    let exported = export_snapshot(data).unwrap();
+    let raw = serde_json::to_string(exported.documents.documents()).unwrap();
+    assert!(
+        raw.contains("fixture-secret-original"),
+        "ordinary service credentials must not be masked"
+    );
+    assert!(!raw.contains("fixture-pin-never-export"));
+    assert!(!raw.contains("codingAgentEnabled"));
+    assert!(!raw.contains("cursorContextEnabled"));
+    assert!(!raw.contains("vocabularyLearningEnabled"));
+    assert!(!raw.contains("fixture-login"));
+    assert!(!raw.contains("activeLlmProvider"));
+    assert!(raw.contains("futureAppearance"));
+    let profile = exported
+        .documents
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::DeviceProfile)
+        .unwrap();
+    assert_eq!(
+        profile.value["preferences"]["codingAgentExe"],
+        "/fixture/never-run"
+    );
+    assert!(!format!("{:?}", exported).contains("fixture-secret-original"));
+}
+
+#[test]
+fn local_asr_channels_are_archived_with_their_credentials_not_globally_activated() {
+    let mut data = snapshot();
+    data.channels.push(ChannelRecord {
+        id: "local-one".into(),
+        namespace: SyncNamespace::Asr,
+        provider_type: "foundry-local-whisper".into(),
+        name: "Windows model".into(),
+        enabled: true,
+        order: 0,
+        active: true,
+        configuration: BTreeMap::new(),
+    });
+    data.provider_credentials.push(ProviderCredentialRecord {
+        channel_id: "local-one".into(),
+        namespace: SyncNamespace::Asr,
+        accounts: BTreeMap::from([("asr.model".into(), "fixture-model".into())]),
+    });
+    let exported = export_snapshot(data).unwrap();
+    assert!(!exported
+        .documents
+        .documents()
+        .documents
+        .iter()
+        .any(|doc| matches!(
+            doc.kind,
+            DocumentKind::Channels | DocumentKind::ProviderCredentials
+        )));
+    let profile = exported
+        .documents
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::DeviceProfile)
+        .unwrap();
+    assert_eq!(profile.value["channels"][0]["id"], "local-one");
+    assert_eq!(
+        profile.value["providerCredentials"][0]["accounts"]["asr.model"],
+        "fixture-model"
+    );
+}
+
+#[test]
+fn history_never_claims_that_remote_audio_exists_locally() {
+    let mut data = snapshot();
+    data.history.push(SecretJson::new(json!({"id":"history-one","createdAt":"2026-09-26T00:00:00Z","source":"quick_note","rawTranscript":"note","finalText":"note","mode":"raw","insertStatus":"notRequested","hasAudioRecording":true})));
+    let exported = export_snapshot(data).unwrap();
+    let row = exported
+        .documents
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::History)
+        .unwrap();
+    assert_eq!(row.value["hasAudioRecording"], false);
+    assert_eq!(row.value["source"], "quick_note");
+}
+
+#[test]
+fn validation_rejects_duplicate_ids_versions_dangling_credentials_and_excluded_preferences() {
+    let base = sample();
+    let mut invalid = base.documents().clone();
+    invalid.documents.push(invalid.documents[0].clone());
+    assert_eq!(
+        validate_sync_documents(invalid, Revision::new(3)).unwrap_err(),
+        DocumentError::DuplicateId
+    );
+    let mut invalid = base.documents().clone();
+    invalid.documents[0].schema_version = 2;
+    assert_eq!(
+        validate_sync_documents(invalid, Revision::new(3)).unwrap_err(),
+        DocumentError::Unsupported
+    );
+    let mut invalid = base.documents().clone();
+    invalid.documents.push(LogicalDocument {
+        id: "remoteInputPin".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value: json!("forbidden"),
+    });
+    assert_eq!(
+        validate_sync_documents(invalid, Revision::new(3)).unwrap_err(),
+        DocumentError::ExcludedField
+    );
+    let mut invalid = export_snapshot(channel_snapshot())
+        .unwrap()
+        .documents
+        .documents()
+        .clone();
+    invalid
+        .documents
+        .retain(|doc| doc.kind != DocumentKind::Channels);
+    assert_eq!(
+        validate_sync_documents(invalid, Revision::new(3)).unwrap_err(),
+        DocumentError::InvalidReference
+    );
+}
+
+#[test]
+fn credential_batch_validation_rejects_oauth_cookie_accounts_and_omni_id_aliases() {
+    let mut data = channel_snapshot();
+    data.provider_credentials[0]
+        .accounts
+        .insert("github.access_token".into(), "fixture-oauth".into());
+    assert_eq!(
+        validate_credential_set(&data.channels, &data.provider_credentials).unwrap_err(),
+        DocumentError::ExcludedField
+    );
+    data.provider_credentials[0]
+        .accounts
+        .remove("github.access_token");
+    data.channels[0].namespace = SyncNamespace::Omni;
+    data.provider_credentials[0].namespace = SyncNamespace::Omni;
+    data.provider_credentials[0].accounts.clear();
+    assert_eq!(
+        validate_credential_set(&data.channels, &data.provider_credentials).unwrap_err(),
+        DocumentError::InvalidReference
+    );
+    data.channels[0].id = "requesty".into();
+    data.provider_credentials[0].channel_id = "requesty".into();
+    validate_credential_set(&data.channels, &data.provider_credentials).unwrap();
+    let mut cookie = channel_snapshot();
+    cookie.provider_credentials[0].accounts.insert(
+        "ark.extra_headers".into(),
+        r#"{"Cookie":"fixture-session"}"#.into(),
+    );
+    assert_eq!(
+        export_snapshot(cookie).unwrap_err(),
+        DocumentError::ExcludedField
+    );
+}
+
+#[test]
+fn unknown_preference_values_roundtrip_and_merge_without_application() {
+    let base = sample();
+    let local = change(
+        &base,
+        DocumentKind::Preferences,
+        "futureAppearance",
+        json!({"value":"preserve-me"}),
+    );
+    let remote = change(&base, DocumentKind::Preferences, "themeMode", json!("dark"));
+    let merged = diff_sync_documents(Some(&base), &local, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert!(merged
+        .documents()
+        .documents
+        .iter()
+        .any(|doc| doc.id == "futureAppearance" && doc.value["value"] == "preserve-me"));
+}
+
+#[test]
+fn capsule_display_exports_new_modes_with_a_v1_compatible_shadow() {
+    for mode in ["primaryScreen", "foregroundWindowScreen"] {
+        let mut data = snapshot();
+        data.preferences = SecretJson::new(json!({"capsuleDisplayMode": mode}));
+        let exported = export_snapshot(data).unwrap();
+        let value = |id: &str| {
+            exported
+                .documents
+                .documents()
+                .documents
+                .iter()
+                .find(|doc| doc.kind == DocumentKind::Preferences && doc.id == id)
+                .map(|doc| doc.value.clone())
+        };
+        assert_eq!(value("capsuleDisplayMode"), Some(json!("cursorScreen")));
+        assert_eq!(value("capsuleDisplayModeV2"), Some(json!(mode)));
+    }
+}
+
+#[test]
+fn capsule_display_v2_survives_retention_upgrade_and_explicit_replacement() {
+    let retained = LogicalDocument {
+        id: "capsuleDisplayModeV2".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value: json!("foregroundWindowScreen"),
+    };
+    for explicit in [None, Some("cursorScreen"), Some("allScreens")] {
+        let mut data = snapshot();
+        data.preferences = SecretJson::new(json!({"capsuleDisplayMode":"cursorScreen"}));
+        if let Some(mode) = explicit {
+            data.preferences.expose_mut()["capsuleDisplayModeV2"] = json!(mode);
+        }
+        data.retained_documents.push(retained.clone());
+        let exported = export_snapshot(data).unwrap();
+        let modes: Vec<_> = exported
+            .documents
+            .documents()
+            .documents
+            .iter()
+            .filter(|doc| doc.id == "capsuleDisplayModeV2")
+            .collect();
+        assert_eq!(modes.len(), 1);
+        assert_eq!(
+            modes[0].value,
+            json!(explicit.unwrap_or("foregroundWindowScreen"))
+        );
+    }
+}
+
+#[test]
+fn capsule_display_legacy_edits_are_not_v2_conflicts() {
+    for mode in [
+        "cursorScreen",
+        "primaryScreen",
+        "foregroundWindowScreen",
+        "allScreens",
+    ] {
+        let mut data = snapshot();
+        data.preferences = SecretJson::new(json!({
+            "themeMode":"system", "capsuleDisplayMode":"cursorScreen", "capsuleDisplayModeV2":mode
+        }));
+        let base = export_snapshot(data).unwrap().documents;
+        let local = change(
+            &base,
+            DocumentKind::Preferences,
+            "capsuleDisplayMode",
+            json!(if mode == "allScreens" {
+                "cursorScreen"
+            } else {
+                "allScreens"
+            }),
+        );
+        let remote = change(&base, DocumentKind::Preferences, "themeMode", json!("dark"));
+        let merged = diff_sync_documents(Some(&base), &local, &remote)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        let mirrored = diff_sync_documents(Some(&base), &remote, &local)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        assert_eq!(merged.documents(), mirrored.documents());
+        assert!(merged
+            .documents()
+            .documents
+            .iter()
+            .any(|doc| doc.id == "capsuleDisplayModeV2" && doc.value == json!(mode)));
+        assert!(merged
+            .documents()
+            .documents
+            .iter()
+            .any(|doc| doc.id == "themeMode" && doc.value == json!("dark")));
+    }
+}
+
+#[test]
+fn capsule_display_v2_rejects_invalid_and_duplicate_documents() {
+    let base = sample();
+    for value in [json!("sometimes"), Value::Null, json!(42)] {
+        let mut set = base.documents().clone();
+        set.documents.push(LogicalDocument {
+            id: "capsuleDisplayModeV2".into(),
+            kind: DocumentKind::Preferences,
+            schema_version: 1,
+            value,
+        });
+        assert_eq!(
+            validate_sync_documents(set, Revision::new(4)).unwrap_err(),
+            DocumentError::InvalidDocument
+        );
+    }
+    let mut set = base.documents().clone();
+    let doc = LogicalDocument {
+        id: "capsuleDisplayModeV2".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value: json!("cursorScreen"),
+    };
+    set.documents.extend([doc.clone(), doc]);
+    assert_eq!(
+        validate_sync_documents(set, Revision::new(4)).unwrap_err(),
+        DocumentError::DuplicateId
+    );
+}
+
+#[test]
+fn independent_stable_ids_merge_but_simultaneous_same_key_changes_do_not() {
+    let base = sample();
+    let local = change(
+        &base,
+        DocumentKind::Dictionary,
+        "local-id",
+        dictionary("local-id", "same name"),
+    );
+    let remote = change(
+        &base,
+        DocumentKind::Dictionary,
+        "remote-id",
+        dictionary("remote-id", "same name"),
+    );
+    let result = diff_sync_documents(Some(&base), &local, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert_eq!(
+        result
+            .documents()
+            .documents
+            .iter()
+            .filter(|doc| doc.kind == DocumentKind::Dictionary)
+            .count(),
+        2
+    );
+    let local = change(&base, DocumentKind::Preferences, "themeMode", json!("dark"));
+    let remote = change(
+        &base,
+        DocumentKind::Preferences,
+        "themeMode",
+        json!("light"),
+    );
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert_eq!(preview.conflicts().len(), 1);
+    assert_eq!(
+        preview.resolve(&[]).unwrap_err(),
+        DocumentError::ConflictChoiceRequired
+    );
+}
+
+#[test]
+fn channel_and_credential_changes_are_one_redacted_conflict_unit() {
+    let base = export_snapshot(channel_snapshot()).unwrap().documents;
+    let mut channel = base
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::Channels)
+        .unwrap()
+        .value
+        .clone();
+    channel["name"] = json!("private-local-name");
+    let local = change(&base, DocumentKind::Channels, "llm:llm-one", channel);
+    let mut credentials = base
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::ProviderCredentials)
+        .unwrap()
+        .value
+        .clone();
+    credentials["accounts"]["ark.api_key"] = json!("fixture-secret-remote");
+    let remote = change(
+        &base,
+        DocumentKind::ProviderCredentials,
+        "llm:llm-one",
+        credentials,
+    );
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert_eq!(preview.conflicts().len(), 1);
+    assert!(preview.conflicts()[0].is_credential_unit);
+    let ui = serde_json::to_string(preview.conflicts()).unwrap();
+    assert!(!ui.contains("fixture-secret"));
+    assert!(!ui.contains("private-local-name"));
+    let choice = ConflictChoice {
+        conflict_id: preview.conflicts()[0].conflict_id.clone(),
+        side: ConflictSide::Remote,
+    };
+    let merged = preview.resolve(&[choice]).unwrap();
+    let channel = merged
+        .documents()
+        .documents
+        .iter()
+        .find(|doc| doc.kind == DocumentKind::Channels)
+        .unwrap();
+    assert_eq!(
+        channel.value["name"], "original",
+        "must not combine half of each channel unit"
+    );
+}
+
+#[test]
+fn deletion_marks_prevent_offline_resurrection_and_conflict_with_edits() {
+    let base = change(
+        &sample(),
+        DocumentKind::Dictionary,
+        "entry",
+        dictionary("entry", "original"),
+    );
+    let mut deleted = base.documents().clone();
+    deleted.documents.retain(|doc| doc.id != "entry");
+    deleted.tombstones.push(Tombstone {
+        id: "entry".into(),
+        kind: DocumentKind::Dictionary,
+        deleted_at: "2026-09-26T01:00:00Z".into(),
+        base_revision: Revision::new(4),
+    });
+    let remote = validate_sync_documents(deleted, Revision::new(5)).unwrap();
+    let merged = diff_sync_documents(Some(&base), &base, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert!(merged
+        .documents()
+        .tombstones
+        .iter()
+        .any(|t| t.id == "entry"));
+    assert!(!merged
+        .documents()
+        .documents
+        .iter()
+        .any(|doc| doc.id == "entry"));
+    let edited = change(
+        &base,
+        DocumentKind::Dictionary,
+        "entry",
+        dictionary("entry", "edited"),
+    );
+    let preview = diff_sync_documents(Some(&base), &edited, &remote).unwrap();
+    assert_eq!(preview.conflicts()[0].reason, ConflictReason::DeleteModify);
+    let mut missing = base.documents().clone();
+    missing.documents.retain(|doc| doc.id != "entry");
+    let missing = validate_sync_documents(missing, Revision::new(4)).unwrap();
+    assert_eq!(
+        diff_sync_documents(Some(&base), &missing, &base).unwrap_err(),
+        DocumentError::MissingTombstone
+    );
+}
+
+#[test]
+fn no_common_baseline_never_treats_a_missing_local_id_as_a_delete() {
+    let local = sample();
+    let remote = change(
+        &local,
+        DocumentKind::Dictionary,
+        "cloud",
+        dictionary("cloud", "remote"),
+    );
+    let result = diff_sync_documents(None, &local, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert!(result
+        .documents()
+        .documents
+        .iter()
+        .any(|doc| doc.id == "cloud"));
+}
+
+#[test]
+fn limits_reject_deep_values_and_oversized_full_snapshots_without_truncating() {
+    let mut value = json!(true);
+    for _ in 0..65 {
+        value = json!([value]);
+    }
+    let mut set = sample().documents().clone();
+    set.documents.push(LogicalDocument {
+        id: "futureNested".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value,
+    });
+    assert_eq!(
+        validate_sync_documents(set, Revision::new(3)).unwrap_err(),
+        DocumentError::PayloadTooLarge
+    );
+    let mut set = sample().documents().clone();
+    set.documents.push(LogicalDocument {
+        id: "futureText".into(),
+        kind: DocumentKind::Preferences,
+        schema_version: 1,
+        value: json!("x".repeat(MAX_JSON_BYTES)),
+    });
+    assert_eq!(
+        validate_sync_documents(set, Revision::new(3)).unwrap_err(),
+        DocumentError::PayloadTooLarge
+    );
+}
+
+#[test]
+fn tombstone_materialization_preserves_all_old_deletions() {
+    let base = change(
+        &sample(),
+        DocumentKind::Dictionary,
+        "remove",
+        dictionary("remove", "old"),
+    );
+    let mut current = base.documents().clone();
+    current.documents.retain(|doc| doc.id != "remove");
+    let updated = record_missing_tombstones(current, &base, "2026-09-26T02:00:00Z").unwrap();
+    assert_eq!(updated.documents().tombstones.len(), 1);
+    let mut next = updated.documents().clone();
+    next.tombstones.clear();
+    let preserved = record_missing_tombstones(next, &updated, "2026-09-26T03:00:00Z").unwrap();
+    assert_eq!(
+        preserved.documents().tombstones,
+        updated.documents().tombstones
+    );
+}
+
+#[test]
+fn scope_and_restore_preview_require_the_exact_revision_and_device() {
+    let scope = SyncScope {
+        service_origin: "https://sync.example.test".into(),
+        owner_github_id: "42".into(),
+        vault_id: "12345678-1234-4234-8234-123456789abc".into(),
+        key_id: "22345678-1234-4234-8234-123456789abc".into(),
+        device_id: "device-a".into(),
+    };
+    let context = RestoreContext {
+        scope,
+        operation_id: "32345678-1234-4234-8234-123456789abc".into(),
+        observed_revision: Revision::new(99),
+        local_generation: Revision::new(7),
+        target_device: source(),
+    };
+    assert_eq!(
+        prepare_sync_restore(sample(), context).unwrap_err(),
+        DocumentError::StalePreview
+    );
+}
+
+#[test]
+fn simultaneous_active_channel_additions_are_a_resolvable_redacted_selection() {
+    let base = sample();
+    let mut local = channel_snapshot();
+    let mut remote = channel_snapshot();
+    local.channels[0].id = "local-new".into();
+    local.provider_credentials[0].channel_id = "local-new".into();
+    remote.channels[0].id = "remote-new".into();
+    remote.provider_credentials[0].channel_id = "remote-new".into();
+    let local = export_snapshot(local).unwrap().documents;
+    let remote = export_snapshot(remote).unwrap().documents;
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert_eq!(preview.conflicts().len(), 1);
+    let choices = preview
+        .conflicts()
+        .iter()
+        .map(|conflict| ConflictChoice {
+            conflict_id: conflict.conflict_id.clone(),
+            side: ConflictSide::Remote,
+        })
+        .collect::<Vec<_>>();
+    let merged = preview.resolve(&choices).unwrap();
+    let channels = merged
+        .documents()
+        .documents
+        .iter()
+        .filter(|doc| doc.kind == DocumentKind::Channels)
+        .collect::<Vec<_>>();
+    assert_eq!(channels.len(), 2);
+    assert_eq!(
+        channels
+            .iter()
+            .filter(|doc| doc.value["active"] == true)
+            .count(),
+        1
+    );
+    assert!(channels
+        .iter()
+        .any(|doc| doc.id == "llm:remote-new" && doc.value["active"] == true));
+}
+
+#[test]
+fn collection_order_is_preserved_independently_of_stable_id_sorting() {
+    let mut source = snapshot();
+    source.dictionary = vec![
+        SecretJson::new(dictionary("z", "newest")),
+        SecretJson::new(dictionary("a", "oldest")),
+    ];
+    let exported = export_snapshot(source).unwrap();
+    let docs = &exported.documents.documents().documents;
+    assert_eq!(
+        docs.iter()
+            .find(|doc| doc.kind == DocumentKind::Dictionary && doc.id == "z")
+            .unwrap()
+            .value["sortIndex"],
+        0
+    );
+    assert_eq!(
+        docs.iter()
+            .find(|doc| doc.kind == DocumentKind::Dictionary && doc.id == "a")
+            .unwrap()
+            .value["sortIndex"],
+        1
+    );
+}
+
+fn history_row(id: &str, created_at: &str, text: &str) -> SecretJson {
+    SecretJson::new(
+        json!({"id":id,"createdAt":created_at,"source":"quick_note","rawTranscript":text,"finalText":text,"mode":"raw","insertStatus":"notRequested","hasAudioRecording":false}),
+    )
+}
+
+/// Newest first, the way the history store keeps its list.
+fn history_set(rows: &[(&str, &str, &str)]) -> ValidatedSyncDocuments {
+    let mut data = snapshot();
+    data.history = rows
+        .iter()
+        .map(|(id, created_at, text)| history_row(id, created_at, text))
+        .collect();
+    export_snapshot(data).unwrap().documents
+}
+
+fn correction_row(id: &str, pattern: &str, replacement: &str, created_at: &str) -> SecretJson {
+    SecretJson::new(json!({
+        "id": id,
+        "pattern": pattern,
+        "replacement": replacement,
+        "enabled": true,
+        "createdAt": created_at,
+        "source": "manual"
+    }))
+}
+
+fn corrections_set(rows: &[(&str, &str, &str, &str)]) -> ValidatedSyncDocuments {
+    let mut data = snapshot();
+    data.corrections = rows
+        .iter()
+        .map(|(id, pattern, replacement, created_at)| {
+            correction_row(id, pattern, replacement, created_at)
+        })
+        .collect();
+    export_snapshot(data).unwrap().documents
+}
+
+fn dictionary_set(rows: Vec<Value>) -> ValidatedSyncDocuments {
+    let mut data = snapshot();
+    data.dictionary = rows.into_iter().map(SecretJson::new).collect();
+    export_snapshot(data).unwrap().documents
+}
+
+fn ids_in_order(set: &ValidatedSyncDocuments, kind: DocumentKind) -> Vec<String> {
+    let mut rows: Vec<_> = set
+        .documents()
+        .documents
+        .iter()
+        .filter(|doc| doc.kind == kind)
+        .collect();
+    rows.sort_by_key(|doc| doc.value["sortIndex"].as_u64().unwrap());
+    rows.into_iter().map(|doc| doc.id.clone()).collect()
+}
+
+#[test]
+fn dictating_on_two_devices_between_syncs_is_not_a_conflict() {
+    let shared = [
+        ("old-2", "2026-09-26T09:00:00Z", "second"),
+        ("old-1", "2026-09-26T08:00:00Z", "first"),
+    ];
+    let base = history_set(&shared);
+    // Each new row lands at the front of its own device's list, pushing every shared row
+    // down by a different amount on the two devices.
+    let local = history_set(&[
+        ("a-2", "2026-09-27T12:00:00Z", "a later"),
+        ("a-1", "2026-09-27T10:00:00Z", "a earlier"),
+        shared[0],
+        shared[1],
+    ]);
+    let remote = history_set(&[("b-1", "2026-09-27T11:00:00Z", "b"), shared[0], shared[1]]);
+
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert!(preview.conflicts().is_empty());
+    let merged = preview.resolve(&[]).unwrap();
+    // Both devices' rows are kept, interleaved by when they were dictated.
+    assert_eq!(
+        ids_in_order(&merged, DocumentKind::History),
+        ["a-2", "b-1", "a-1", "old-2", "old-1"]
+    );
+
+    // The other device reaches the same result from its side.
+    let mirrored = diff_sync_documents(Some(&base), &remote, &local)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert_eq!(
+        ids_in_order(&mirrored, DocumentKind::History),
+        ids_in_order(&merged, DocumentKind::History)
+    );
+}
+
+#[test]
+fn equal_or_undated_history_records_converge_with_stable_ties() {
+    let assert_converges = |created_at: &str| {
+        let local = history_set(&[
+            ("first", created_at, "first"),
+            ("second", created_at, "second"),
+        ]);
+        let remote = history_set(&[
+            ("second", created_at, "second"),
+            ("first", created_at, "first"),
+        ]);
+
+        assert_eq!(
+            ids_in_order(&local, DocumentKind::History),
+            ["first", "second"]
+        );
+        assert_eq!(
+            ids_in_order(&remote, DocumentKind::History),
+            ["second", "first"]
+        );
+
+        let forward = diff_sync_documents(None, &local, &remote)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        let mirrored = diff_sync_documents(None, &remote, &local)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        assert_eq!(
+            ids_in_order(&forward, DocumentKind::History),
+            ids_in_order(&mirrored, DocumentKind::History)
+        );
+        assert_eq!(
+            ids_in_order(&forward, DocumentKind::History),
+            ["first", "second"]
+        );
+
+        let third = history_set(&[
+            ("second", created_at, "second"),
+            ("first", created_at, "first"),
+        ]);
+        let forward_again = diff_sync_documents(None, &forward, &third)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        let mirrored_again = diff_sync_documents(None, &mirrored, &third)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        assert_eq!(
+            ids_in_order(&forward_again, DocumentKind::History),
+            ids_in_order(&mirrored_again, DocumentKind::History)
+        );
+        assert_eq!(
+            ids_in_order(&forward_again, DocumentKind::History),
+            ["first", "second"]
+        );
+    };
+
+    assert_converges("2026-09-27T10:00:00Z");
+    assert_converges("");
+}
+
+#[test]
+fn agreed_legacy_correction_order_survives_merge() {
+    let local = corrections_set(&[("z", "foo", "bar", ""), ("a", "bar", "baz", "")]);
+    let remote = corrections_set(&[("z", "foo", "bar", ""), ("a", "bar", "baz", "")]);
+
+    let merged = diff_sync_documents(None, &local, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+
+    assert_eq!(ids_in_order(&merged, DocumentKind::Corrections), ["z", "a"]);
+}
+
+#[test]
+fn shared_legacy_correction_order_survives_one_sided_addition() {
+    let local = corrections_set(&[
+        ("new", "new", "value", ""),
+        ("z", "foo", "bar", ""),
+        ("a", "bar", "baz", ""),
+    ]);
+    let remote = corrections_set(&[("z", "foo", "bar", ""), ("a", "bar", "baz", "")]);
+
+    let forward = diff_sync_documents(None, &local, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    let mirrored = diff_sync_documents(None, &remote, &local)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+
+    assert_eq!(
+        ids_in_order(&forward, DocumentKind::Corrections),
+        ["new", "z", "a"]
+    );
+    assert_eq!(
+        ids_in_order(&forward, DocumentKind::Corrections),
+        ids_in_order(&mirrored, DocumentKind::Corrections)
+    );
+}
+
+#[test]
+fn one_sided_legacy_correction_order_survives_merge() {
+    let empty = corrections_set(&[]);
+    let remote = corrections_set(&[("z", "cat", "dog", ""), ("a", "dog", "fox", "")]);
+
+    let forward = diff_sync_documents(None, &empty, &remote)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    let mirrored = diff_sync_documents(None, &remote, &empty)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+
+    assert_eq!(
+        ids_in_order(&forward, DocumentKind::Corrections),
+        ["z", "a"]
+    );
+    assert_eq!(
+        ids_in_order(&forward, DocumentKind::Corrections),
+        ids_in_order(&mirrored, DocumentKind::Corrections)
+    );
+}
+
+#[test]
+fn records_that_differ_only_in_list_position_merge_without_a_baseline() {
+    let local = history_set(&[
+        ("only-local", "2026-09-27T10:00:00Z", "local"),
+        ("shared", "2026-09-26T08:00:00Z", "same text"),
+    ]);
+    let remote = history_set(&[("shared", "2026-09-26T08:00:00Z", "same text")]);
+    let preview = diff_sync_documents(None, &local, &remote).unwrap();
+    assert!(preview.conflicts().is_empty());
+}
+
+#[test]
+fn editing_the_same_record_on_both_devices_is_still_a_conflict() {
+    let base = history_set(&[("shared", "2026-09-26T08:00:00Z", "original")]);
+    let local = history_set(&[("shared", "2026-09-26T08:00:00Z", "edited here")]);
+    let remote = history_set(&[
+        ("new-remote", "2026-09-27T10:00:00Z", "unrelated"),
+        ("shared", "2026-09-26T08:00:00Z", "edited there"),
+    ]);
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert_eq!(preview.conflicts().len(), 1);
+    assert_eq!(preview.conflicts()[0].kind, DocumentKind::History);
+    assert_eq!(preview.conflicts()[0].reason, ConflictReason::BothModified);
+}
+
+#[test]
+fn dictionary_hits_keep_the_highest_count_instead_of_conflicting() {
+    let word = |hits: u64, phrase: &str| json!({"id":"w1","phrase":phrase,"note":null,"enabled":true,"hits":hits,"createdAt":"2026-09-26T00:00:00Z"});
+    let word_of = |set: &ValidatedSyncDocuments| {
+        set.documents()
+            .documents
+            .iter()
+            .find(|doc| doc.kind == DocumentKind::Dictionary)
+            .unwrap()
+            .value
+            .clone()
+    };
+    let base = dictionary_set(vec![word(1, "OpenLess")]);
+
+    // Used on both devices, edited on neither.
+    let preview = diff_sync_documents(
+        Some(&base),
+        &dictionary_set(vec![word(4, "OpenLess")]),
+        &dictionary_set(vec![word(6, "OpenLess")]),
+    )
+    .unwrap();
+    assert!(preview.conflicts().is_empty());
+    assert_eq!(word_of(&preview.resolve(&[]).unwrap())["hits"], 6);
+
+    // Renamed on the other device while this one kept using it: the rename wins, and
+    // this device's higher count is not thrown away with its old spelling.
+    let preview = diff_sync_documents(
+        Some(&base),
+        &dictionary_set(vec![word(9, "OpenLess")]),
+        &dictionary_set(vec![word(2, "OpenLess IME")]),
+    )
+    .unwrap();
+    assert!(preview.conflicts().is_empty());
+    let merged = word_of(&preview.resolve(&[]).unwrap());
+    assert_eq!(merged["phrase"], "OpenLess IME");
+    assert_eq!(merged["hits"], 9);
+
+    // Renamed differently on both devices is a real conflict; either choice keeps the
+    // highest count.
+    let local = dictionary_set(vec![word(9, "Open Less")]);
+    let remote = dictionary_set(vec![word(2, "OpenLess IME")]);
+    let preview = diff_sync_documents(Some(&base), &local, &remote).unwrap();
+    assert_eq!(preview.conflicts().len(), 1);
+    let choice = ConflictChoice {
+        conflict_id: preview.conflicts()[0].conflict_id.clone(),
+        side: ConflictSide::Remote,
+    };
+    let merged = word_of(&preview.resolve(&[choice]).unwrap());
+    assert_eq!(merged["phrase"], "OpenLess IME");
+    assert_eq!(merged["hits"], 9);
+}
+
+#[test]
+fn collection_order_is_canonicalized_only_after_merge() {
+    let learned = crate::shared_types::LEARNED_VOCAB_NOTE;
+    let entry = |id: &str, note: Option<&str>, created_at: &str| json!({"id":id,"phrase":id,"note":note,"enabled":true,"hits":0,"createdAt":created_at});
+    // Direct validation preserves the order exported by the local store.
+    let set = dictionary_set(vec![
+        entry("learned-new", Some(learned), "2026-09-28T00:00:00Z"),
+        entry("manual-old", None, "2026-09-28T17:00:00Z"),
+        entry("undated", None, ""),
+        entry("learned-old", Some(learned), "2026-09-27T00:00:00Z"),
+        entry("manual-new", None, "2026-09-29T00:00:00+08:00"),
+    ]);
+    assert_eq!(
+        ids_in_order(&set, DocumentKind::Dictionary),
+        [
+            "learned-new",
+            "manual-old",
+            "undated",
+            "learned-old",
+            "manual-new"
+        ]
+    );
+
+    // Merge validation canonicalizes by record data, including the offset instant.
+    let merged = diff_sync_documents(None, &set, &set)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert_eq!(
+        ids_in_order(&merged, DocumentKind::Dictionary),
+        [
+            "manual-old",
+            "manual-new",
+            "undated",
+            "learned-old",
+            "learned-new"
+        ]
+    );
+
+    let history = history_set(&[
+        ("morning", "2026-09-27T08:00:00Z", "m"),
+        ("evening", "2026-09-27T20:00:00Z", "e"),
+    ]);
+    let merged = diff_sync_documents(None, &history, &history)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert_eq!(
+        ids_in_order(&merged, DocumentKind::History),
+        ["evening", "morning"]
+    );
+}
+
+fn assert_collection_merge_is_stable(
+    baseline: Option<&ValidatedSyncDocuments>,
+    local: &ValidatedSyncDocuments,
+    remote: &ValidatedSyncDocuments,
+    kind: DocumentKind,
+    expected: &[&str],
+) -> ValidatedSyncDocuments {
+    let forward = diff_sync_documents(baseline, local, remote).unwrap();
+    assert!(forward.conflicts().is_empty());
+    let merged = forward.resolve(&[]).unwrap();
+    assert_eq!(ids_in_order(&merged, kind), expected);
+    let mirrored = diff_sync_documents(baseline, remote, local)
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+    assert!(merged.documents().documents == mirrored.documents().documents);
+    for original in [local, remote] {
+        let repeated = diff_sync_documents(None, &merged, original)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        assert!(merged.documents().documents == repeated.documents().documents);
+    }
+    merged
+}
+
+#[test]
+fn tied_correction_rules_keep_one_sided_execution_order() {
+    for created_at in ["", "2026-09-27T10:00:00Z"] {
+        let remote = corrections_set(&[
+            ("z", "foo", "bar", created_at),
+            ("a", "bar", "baz", created_at),
+        ]);
+        let local = corrections_set(&[
+            ("new", "start", "foo", created_at),
+            ("z", "foo", "bar", created_at),
+            ("a", "bar", "baz", created_at),
+        ]);
+        for baseline in [None, Some(&remote)] {
+            let merged = assert_collection_merge_is_stable(
+                baseline,
+                &local,
+                &remote,
+                DocumentKind::Corrections,
+                &["new", "z", "a"],
+            );
+            let apply = |set: &ValidatedSyncDocuments| {
+                let mut docs: Vec<_> = set
+                    .documents()
+                    .documents
+                    .iter()
+                    .filter(|doc| doc.kind == DocumentKind::Corrections)
+                    .collect();
+                docs.sort_by_key(|doc| doc.value["sortIndex"].as_u64().unwrap());
+                let rules: Vec<crate::types::CorrectionRule> = docs
+                    .into_iter()
+                    .map(|doc| serde_json::from_value(doc.value.clone()).unwrap())
+                    .collect();
+                crate::correction::apply_correction_rules("start", &rules)
+            };
+            assert_eq!(apply(&local), "baz");
+            assert_eq!(apply(&merged), apply(&local));
+        }
+    }
+}
+
+#[test]
+fn tied_collection_gaps_preserve_both_device_orders() {
+    let cases: &[(&[&str], &[&str], &[&str])] = &[
+        (&["new", "z", "a"], &["z", "a"], &["new", "z", "a"]),
+        (&["z", "new", "a"], &["z", "a"], &["z", "new", "a"]),
+        (&["z", "a", "new"], &["z", "a"], &["z", "a", "new"]),
+        (
+            &["l2", "l1", "z", "l4", "l3", "a", "l6", "l5"],
+            &["r2", "r1", "z", "r4", "r3", "a", "r6", "r5"],
+            &[
+                "l2", "l1", "r2", "r1", "z", "l4", "l3", "r4", "r3", "a", "l6", "l5", "r6", "r5",
+            ],
+        ),
+    ];
+    for kind in [
+        DocumentKind::Corrections,
+        DocumentKind::Dictionary,
+        DocumentKind::History,
+    ] {
+        for created_at in ["", "2026-09-27T10:00:00Z"] {
+            let collection = |ids: &[&str]| match kind {
+                DocumentKind::Corrections => corrections_set(
+                    &ids.iter()
+                        .map(|id| (*id, *id, "value", created_at))
+                        .collect::<Vec<_>>(),
+                ),
+                DocumentKind::Dictionary => dictionary_set(
+                    ids.iter()
+                        .map(|id| {
+                            json!({
+                                "id": id,
+                                "phrase": id,
+                                "note": null,
+                                "enabled": true,
+                                "hits": 0,
+                                "createdAt": created_at
+                            })
+                        })
+                        .collect(),
+                ),
+                DocumentKind::History => history_set(
+                    &ids.iter()
+                        .map(|id| (*id, created_at, *id))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => unreachable!(),
+            };
+            let baseline = collection(&["z", "a"]);
+            for &(local, remote, expected) in cases {
+                assert_collection_merge_is_stable(
+                    Some(&baseline),
+                    &collection(local),
+                    &collection(remote),
+                    kind,
+                    expected,
+                );
+            }
+        }
+    }
+}

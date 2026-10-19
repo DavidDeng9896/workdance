@@ -1,0 +1,5220 @@
+//! Thin Tauri implementations of the framework-independent core ports.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use futures_util::future::BoxFuture;
+use openless_core::{
+    ActiveRecording, AudioConsumer as CoreAudioConsumer, AudioRecorder, AudioRecorderRouter,
+    BackendError, BackendErrorCode, CaptureStartRequest, CapturedTextTarget, DictationContext,
+    DictationEngine, EditObservationAdapter, EditObservationSink, ExternalAudioRecorder,
+    HostAction, HostActions, InsertOutcome, InsertWriteResult, PendingAudioCapture,
+    RecordingArchive, RecordingProgressSink, SessionId, TextInserter as CoreTextInserter,
+    TextInsertionSession, TextPolisher, TextStreamChunk, TextStreamSink, TranscriptOutput,
+    TranscriptionEngine, TranscriptionSession,
+};
+use parking_lot::Mutex;
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::recorder::{
+    warm_capture_hub, AudioConsumer as LegacyAudioConsumer, Recorder, RecorderError,
+    StagedRecorder, WarmActiveCapture, WarmCaptureHub, WarmStagedRecorder,
+    STAGED_CAPTURE_MAX_BYTES,
+};
+
+pub(crate) type AppHandleSlot = Arc<Mutex<Option<AppHandle>>>;
+
+pub(crate) fn app_handle_slot() -> AppHandleSlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// Late-bound Core backend shared with adapters that are constructed before
+/// `OpenLessBackend::new` returns. The weak reference keeps Core ownership
+/// explicit without making an adapter query Tauri managed state through
+/// `AppHandle` or creating a backend/adapter reference cycle.
+pub(crate) type BackendSlot = Arc<Mutex<Option<std::sync::Weak<openless_core::OpenLessBackend>>>>;
+
+pub(crate) fn backend_slot() -> BackendSlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// Native audio callbacks and resource destructors do not inherit Tokio's
+/// thread-local context. Always enqueue on Tauri's shared executor instead of
+/// asking the callback thread for a runtime and silently losing its cleanup.
+struct TauriTaskSpawner;
+
+impl openless_core::TaskSpawner for TauriTaskSpawner {
+    fn spawn(&self, task: BoxFuture<'static, ()>) {
+        tauri::async_runtime::spawn(task);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TauriNativeAsrDependencies {
+    foundry: Arc<crate::asr::local::FoundryLocalRuntime>,
+    sherpa: Arc<crate::asr::local::SherpaOnnxRuntime>,
+    #[cfg(local_asr_sherpa)]
+    foundry_generation: Arc<AtomicU64>,
+    #[cfg(local_asr_sherpa)]
+    sherpa_generation: Arc<AtomicU64>,
+}
+
+impl TauriNativeAsrDependencies {
+    #[cfg(local_asr_sherpa)]
+    pub(crate) fn new(
+        foundry: Arc<crate::asr::local::FoundryLocalRuntime>,
+        sherpa: Arc<crate::asr::local::SherpaOnnxRuntime>,
+    ) -> Self {
+        Self {
+            foundry,
+            sherpa,
+            foundry_generation: Arc::new(AtomicU64::new(0)),
+            sherpa_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(not(local_asr_sherpa))]
+    pub(crate) fn new() -> Self {
+        Self {
+            foundry: Arc::new(crate::asr::local::FoundryLocalRuntime::new()),
+            sherpa: Arc::new(crate::asr::local::SherpaOnnxRuntime::new()),
+        }
+    }
+}
+
+pub(crate) fn backend_dependencies(
+    app: AppHandleSlot,
+    backend: BackendSlot,
+    native_asr_dependencies: TauriNativeAsrDependencies,
+    preferences: Arc<openless_core::PreferencesStore>,
+    hotkey_status: Arc<Mutex<openless_core::HotkeyStatus>>,
+    qa_host_context: Arc<crate::qa_adapter::TauriQaHostContext>,
+) -> openless_core::BackendDependencies {
+    // The Tauri host owns the Tokio executor used by shared core providers.
+    // Keep this spawner explicit so core never falls back to constructing a
+    // runtime during cancellation or background cleanup.
+    let task_spawner: Arc<dyn openless_core::TaskSpawner> = Arc::new(TauriTaskSpawner);
+    let model_store = crate::persistence::models_root()
+        .ok()
+        .and_then(|root| openless_core::ModelStoreConfig::new(root).ok())
+        .and_then(|config| openless_core::ModelStore::new(config).ok())
+        .map(Arc::new);
+    #[cfg(target_os = "macos")]
+    {
+        // File-only, idempotent retirement. Do this before Core migrates old roots.
+        if let Some(store) = &model_store {
+            let mut roots = vec![store.models_root_dir()];
+            if let Ok(root) = crate::persistence::default_models_root() { roots.push(root); }
+            roots.sort();
+            roots.dedup();
+            for root in roots {
+                if let Err(error) = store.retire_macos_local_models(&root) {
+                    log::error!("[local-asr-retirement] cleanup will retry next startup: {error}");
+                }
+            }
+        }
+        if let Err(error) = crate::persistence::CredentialsVault::retire_macos_local_asr() {
+            log::error!("[local-asr-retirement] credential migration will retry: {error}");
+        }
+    }
+    let credential_store: Arc<dyn openless_core::CredentialStore> = Arc::new(
+        crate::commands::SystemCredentialStore::new(model_store.clone()),
+    );
+    let warm_hub = warm_capture_hub();
+    #[cfg(target_os = "windows")]
+    {
+        let prefs = preferences.get();
+        warm_hub.configure(
+            prefs.low_latency_dictation_enabled,
+            (!prefs.microphone_device_name.trim().is_empty())
+                .then(|| prefs.microphone_device_name.clone()),
+            openless_core::AudioProcessingConfig {
+                enhancement_enabled: prefs.audio_enhancement_enabled,
+            },
+        );
+    }
+    let local_asr_runtime = Arc::new(TauriLocalAsrRuntimeAdapter::new(native_asr_dependencies.clone()));
+    let transcription = Arc::new(openless_core::TranscriptionRouter::default());
+    let experimental_asr = model_store.as_ref().filter(|_| cfg!(target_os = "macos")).and_then(|store| {
+        let runtime = crate::asr::local::experimental::ExperimentalNativeRuntime::new();
+        let path = crate::persistence::data_dir()
+            .ok()?
+            .join("experimental-asr.json");
+        let service = match openless_core::experimental_asr::ExperimentalAsrService::new(
+            Arc::clone(store),
+            Arc::clone(&credential_store),
+            runtime.clone(),
+            Arc::clone(&task_spawner),
+            path,
+        ) {
+            Ok(service) => service,
+            Err(error) => {
+                log::error!("[experimental-asr] cannot load settings: {error}");
+                return None;
+            }
+        };
+        let engine: Arc<dyn TranscriptionEngine> = Arc::new(
+            crate::asr::local::experimental::ExperimentalTranscriptionEngine {
+                models: Arc::clone(&service),
+                runtime,
+            },
+        );
+        for model in openless_core::experimental_asr::ExperimentalAsrModel::ALL {
+            transcription
+                .register(model.provider_type(), Arc::clone(&engine))
+                .expect("experimental provider ID");
+        }
+        let channel_backend = Arc::clone(&backend);
+        service.set_channel_change_handler(Arc::new(move || {
+            let backend = channel_backend
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            Box::pin(async move {
+                if let Some(backend) = backend {
+                    if let Err(error) = backend.refresh_and_publish_credentials().await {
+                        log::warn!("[experimental-asr] credential status refresh failed: {error}");
+                    }
+                }
+            })
+        }));
+        service.resume();
+        Some(service)
+    });
+    let production_asr: Arc<dyn TranscriptionEngine> = Arc::new(
+        openless_core::SharedCloudTranscriptionEngine::with_task_spawner(
+            Arc::clone(&credential_store),
+            Arc::clone(&task_spawner),
+        ),
+    );
+    for provider_type in openless_core::SHARED_CLOUD_ASR_PROVIDER_TYPES {
+        transcription
+            .register(*provider_type, Arc::clone(&production_asr))
+            .expect("built-in ASR provider ids are non-empty");
+    }
+    #[cfg(local_asr_sherpa)]
+    let native_asr: Arc<dyn TranscriptionEngine> = Arc::new(TauriNativeTranscriptionEngine::new(
+        native_asr_dependencies,
+        model_store.clone(),
+        Arc::clone(&backend),
+    ));
+    #[cfg(not(local_asr_sherpa))]
+    let _ = native_asr_dependencies;
+    // Foundry is Windows-only; Sherpa runs wherever sherpa-onnx is linked
+    // (Windows and arm64 Android — see build.rs).
+    #[cfg(target_os = "windows")]
+    for provider_type in [
+        crate::asr::local::foundry::PROVIDER_ID,
+        "foundry-local",
+        "foundry-whisper",
+    ] {
+        transcription
+            .register(provider_type, Arc::clone(&native_asr))
+            .expect("native ASR provider ids are non-empty");
+    }
+    #[cfg(local_asr_sherpa)]
+    for provider_type in [crate::asr::local::sherpa::PROVIDER_ID, "sherpa-onnx"] {
+        transcription
+            .register(provider_type, Arc::clone(&native_asr))
+            .expect("native ASR provider ids are non-empty");
+    }
+    #[cfg(target_os = "macos")]
+    transcription
+        .register(
+            crate::asr::apple_speech::PROVIDER_ID,
+            Arc::new(crate::asr::apple_speech::AppleSpeechTranscriptionEngine),
+        )
+        .expect("Apple system speech provider ID");
+    let polisher = Arc::new(openless_core::TextPolisherRouter::default());
+    let production_polisher: Arc<dyn TextPolisher> = Arc::new(
+        openless_core::SharedCloudTextPolisher::new(Arc::clone(&credential_store)),
+    );
+    for provider_type in openless_core::SHARED_CLOUD_LLM_PROVIDER_TYPES {
+        polisher
+            .register(*provider_type, Arc::clone(&production_polisher))
+            .expect("built-in LLM provider ids are non-empty");
+    }
+    let polisher: Arc<dyn TextPolisher> = polisher;
+    let auxiliary_transcription: Arc<dyn TranscriptionEngine> = transcription.clone();
+    // Explicitly supported provider probes share the dictation router.
+    let provider_native_transcription: Arc<dyn TranscriptionEngine> = transcription.clone();
+    let auxiliary_polisher: Arc<dyn TextPolisher> =
+        Arc::new(openless_core::SharedAuxiliaryTextPolisher::new(
+            Arc::clone(&credential_store),
+            Arc::clone(&polisher),
+        ));
+    let host_recorder: Arc<dyn AudioRecorder> = Arc::new(TauriAudioRecorder {
+        app: Arc::clone(&app),
+        backend: Arc::clone(&backend),
+        warm_hub,
+    });
+    let external = match crate::persistence::data_dir() {
+        Ok(directory) => {
+            ExternalAudioRecorder::with_recordings_directory(directory.join("recordings"))
+        }
+        Err(error) => {
+            log::warn!("[remote-input] 无法定位录音目录：{error}");
+            ExternalAudioRecorder::default()
+        }
+    };
+    let recorder: Arc<dyn AudioRecorder> = Arc::new(AudioRecorderRouter::new(
+        Arc::clone(&host_recorder),
+        external,
+    ));
+    let traditional = Arc::new(
+        openless_core::PipelineDictationEngine::new(
+            Arc::clone(&recorder),
+            transcription,
+            Arc::clone(&polisher),
+        )
+        .with_local_startup_spawner(Arc::clone(&task_spawner)),
+    );
+    let dictation = Arc::new(openless_core::DictationEngineRouter::new(traditional));
+    let production_omni: Arc<dyn DictationEngine> = Arc::new(
+        openless_core::SharedOmniDictationEngine::new(Arc::clone(&credential_store), recorder),
+    );
+    for provider_type in openless_core::SHARED_OMNI_PROVIDER_TYPES {
+        dictation
+            .register_omni(*provider_type, Arc::clone(&production_omni))
+            .expect("built-in Omni provider ids are non-empty");
+    }
+    let mut dependencies = openless_core::BackendDependencies::unsupported();
+    if let Some(model_store) = model_store {
+        dependencies.services.configure_model_store(model_store);
+    }
+    dependencies
+        .services
+        .configure_auxiliary_runtime(auxiliary_polisher, auxiliary_transcription);
+    dependencies.services.provider = Arc::new(
+        openless_core::ProviderService::new(
+            Arc::clone(&credential_store),
+            Arc::clone(&task_spawner),
+        )
+        .with_native_transcription(provider_native_transcription),
+    );
+    dependencies
+        .services
+        .configure_coding_agent_process(Arc::new(
+            crate::coding_agent::TauriCodingAgentProcessAdapter,
+        ));
+    dependencies.qa_runtime = Some(Arc::new(crate::qa_adapter::TauriQaRuntimeAdapter::new(
+        Arc::clone(&app),
+        Arc::clone(&backend),
+        Arc::clone(&credential_store),
+        Arc::clone(&qa_host_context),
+    )));
+    #[cfg(not(mobile))]
+    {
+        let runtime = Arc::new(TauriRemoteInputRuntimeAdapter::new(Arc::clone(&app)));
+        dependencies.services.remote_input = Arc::new(
+            openless_core::RemoteInputService::new(runtime, 8443, "zh-CN")
+                .expect("built-in remote input defaults are valid"),
+        );
+    }
+    dependencies.services.platform =
+        Arc::new(TauriPlatformApi::new(Arc::clone(&app), hotkey_status));
+    dependencies.services.host_context = Arc::new(TauriHostContextAdapter::default());
+    dependencies.services.edit_observation = Arc::new(TauriEditObservationAdapter::default());
+    dependencies.services.experimental_asr = experimental_asr;
+    dependencies.local_asr_runtime = Some(local_asr_runtime);
+    #[cfg(not(mobile))]
+    {
+        dependencies.selection_runtime =
+            Some(Arc::new(TauriSelectionRuntime::new(Arc::clone(&app))));
+        dependencies.selection_polisher = Some(polisher);
+    }
+    dependencies.text_inserter = Arc::new(TauriTextInserter::new(Arc::clone(&app), backend));
+    dependencies.host_actions = Arc::new(TauriHostActions::new(app, qa_host_context));
+    dependencies.dictation_engine = dictation;
+    dependencies.credential_store = credential_store;
+    dependencies.task_spawner = task_spawner;
+    dependencies
+}
+
+fn local_asr_backend_error(code: BackendErrorCode, error: impl std::fmt::Display) -> BackendError {
+    BackendError::new(code, error.to_string())
+}
+
+struct TauriLocalAsrRuntimeAdapter {
+    native: TauriNativeAsrDependencies,
+    foundry_rebind_pending: Arc<AtomicBool>,
+}
+
+impl TauriLocalAsrRuntimeAdapter {
+    fn new(native: TauriNativeAsrDependencies) -> Self {
+        Self {
+            native,
+            foundry_rebind_pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl openless_core::ModelRuntimeAdapter for TauriLocalAsrRuntimeAdapter {
+    fn engine_available(&self, runtime: openless_core::LocalAsrRuntime) -> bool {
+        match runtime {
+            openless_core::LocalAsrRuntime::Generic => false,
+            openless_core::LocalAsrRuntime::Foundry => cfg!(target_os = "windows"),
+            openless_core::LocalAsrRuntime::SherpaOnnx => cfg!(local_asr_sherpa),
+        }
+    }
+
+    fn supports_model(&self, target: &openless_core::LocalAsrTarget) -> bool {
+        self.engine_available(target.runtime)
+    }
+
+    fn inspect_native_models(
+        &self,
+        targets: Vec<openless_core::LocalAsrTarget>,
+    ) -> BoxFuture<'static, Result<Vec<openless_core::NativeModelState>, BackendError>> {
+        let foundry = Arc::clone(&self.native.foundry);
+        Box::pin(async move {
+            let foundry_targets = targets
+                .into_iter()
+                .filter(|target| target.runtime == openless_core::LocalAsrRuntime::Foundry)
+                .collect::<Vec<_>>();
+            if foundry_targets.is_empty() {
+                return Ok(Vec::new());
+            }
+            let aliases = foundry_targets
+                .iter()
+                .map(|target| target.model_id().to_string())
+                .collect::<Vec<_>>();
+            let states = foundry.inspect_models(&aliases).await.map_err(|error| {
+                local_asr_backend_error(BackendErrorCode::Platform, format!("{error:#}"))
+            })?;
+            Ok(states
+                .into_iter()
+                .filter_map(|state| {
+                    foundry_targets
+                        .iter()
+                        .find(|target| target.model_id() == state.alias)
+                        .cloned()
+                        .map(|target| openless_core::NativeModelState {
+                            target,
+                            installed: state.cached,
+                            size_bytes: state.size_bytes,
+                            display_name: state.display_name,
+                        })
+                })
+                .collect())
+        })
+    }
+
+    fn restart_required(&self, runtime: openless_core::LocalAsrRuntime) -> bool {
+        #[cfg(target_os = "windows")]
+        if runtime == openless_core::LocalAsrRuntime::Foundry {
+            return self.native.foundry.restart_required()
+                || self.foundry_rebind_pending.load(Ordering::Acquire);
+        }
+        let _ = runtime;
+        false
+    }
+
+    fn download_native_model(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        source: openless_core::FoundryRuntimeSource,
+        progress: openless_core::ModelPrepareProgressSink,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        #[cfg(target_os = "windows")]
+        {
+            let foundry = Arc::clone(&self.native.foundry);
+            let rebind_pending = Arc::clone(&self.foundry_rebind_pending);
+            return Box::pin(async move {
+                if target.runtime != openless_core::LocalAsrRuntime::Foundry {
+                    return Err(BackendError::new(
+                        BackendErrorCode::Unsupported,
+                        "native download is only available for Foundry",
+                    ));
+                }
+                if rebind_pending.load(Ordering::Acquire) {
+                    return Err(BackendError::new(
+                        BackendErrorCode::InvalidState,
+                        "Foundry storage changed; restart is required",
+                    ));
+                }
+                foundry
+                    .download_with_progress(target.model_id(), source.as_str(), move |payload| {
+                        let phase = match payload.phase {
+                            crate::asr::local::foundry::FoundryPreparePhase::Runtime => {
+                                openless_core::LocalAsrPreparePhase::Runtime
+                            }
+                            crate::asr::local::foundry::FoundryPreparePhase::Model => {
+                                openless_core::LocalAsrPreparePhase::Model
+                            }
+                            crate::asr::local::foundry::FoundryPreparePhase::Load => {
+                                openless_core::LocalAsrPreparePhase::Load
+                            }
+                            crate::asr::local::foundry::FoundryPreparePhase::Finished => {
+                                openless_core::LocalAsrPreparePhase::Finished
+                            }
+                            crate::asr::local::foundry::FoundryPreparePhase::Failed => {
+                                openless_core::LocalAsrPreparePhase::Failed
+                            }
+                        };
+                        progress(openless_core::LocalAsrPrepareProgress {
+                            runtime: openless_core::LocalAsrRuntimeKind::Foundry,
+                            phase,
+                            model_alias: payload.model_alias,
+                            label: payload.label,
+                            percent: payload.percent,
+                            error: payload.error,
+                        });
+                    })
+                    .await
+                    .map_err(map_native_asr_error)
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (target, source, progress);
+            Box::pin(async {
+                Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "Foundry is only available on Windows",
+                ))
+            })
+        }
+    }
+
+    fn native_model_dir(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        fallback: PathBuf,
+    ) -> BoxFuture<'static, Result<PathBuf, BackendError>> {
+        if target.runtime != openless_core::LocalAsrRuntime::Foundry {
+            return Box::pin(async move { Ok(fallback) });
+        }
+        let foundry = Arc::clone(&self.native.foundry);
+        Box::pin(async move {
+            foundry
+                .model_dir_for_alias(target.model_id())
+                .await
+                .map_err(|error| {
+                    local_asr_backend_error(BackendErrorCode::Platform, format!("{error:#}"))
+                })
+        })
+    }
+
+    fn delete_native_model(
+        &self,
+        target: openless_core::LocalAsrTarget,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let foundry = Arc::clone(&self.native.foundry);
+        Box::pin(async move {
+            if target.runtime != openless_core::LocalAsrRuntime::Foundry {
+                return Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "only Foundry uses native model deletion",
+                ));
+            }
+            foundry
+                .delete_model(target.model_id())
+                .await
+                .map_err(|error| {
+                    local_asr_backend_error(BackendErrorCode::Platform, format!("{error:#}"))
+                })
+        })
+    }
+
+    fn rebind_storage(
+        &self,
+        _models_root: PathBuf,
+    ) -> BoxFuture<'static, Result<openless_core::StorageRebind, BackendError>> {
+        let restart_required = self.native.foundry.storage_configuration_locked();
+        self.foundry_rebind_pending
+            .store(restart_required, Ordering::Release);
+        Box::pin(async move {
+            Ok(if restart_required {
+                openless_core::StorageRebind::RestartRequired
+            } else {
+                openless_core::StorageRebind::Applied
+            })
+        })
+    }
+
+    fn runtime_status(
+        &self,
+        settings: openless_core::LocalAsrSettings,
+        _model_dir: PathBuf,
+    ) -> BoxFuture<'static, Result<openless_core::LocalAsrRuntimeStatus, BackendError>> {
+        let foundry = Arc::clone(&self.native.foundry);
+        let sherpa = Arc::clone(&self.native.sherpa);
+        Box::pin(async move {
+            match settings.runtime {
+                openless_core::LocalAsrRuntime::Generic => {
+                    let loaded: Option<String> = None;
+                    Ok(openless_core::LocalAsrRuntimeStatus {
+                        restart_required: false,
+                        runtime: settings.runtime,
+                        provider_id: settings.provider_id,
+                        available: false,
+                        loaded: loaded.is_some(),
+                        active_model: settings.active_model,
+                        model_id: loaded,
+                        keep_loaded_secs: settings.keep_loaded_secs,
+                        runtime_source: None,
+                        endpoint: None,
+                        operation: None,
+                        error: None,
+                        last_error: None,
+                        last_prepare_ms: None,
+                        last_transcribe_ms: None,
+                        last_audio_ms: None,
+                    })
+                }
+                openless_core::LocalAsrRuntime::Foundry => {
+                    let status = foundry
+                        .status_snapshot(
+                            &settings.active_model,
+                            settings.runtime_source.unwrap_or_default().as_str(),
+                        )
+                        .await;
+                    Ok(openless_core::LocalAsrRuntimeStatus {
+                        restart_required: false,
+                        runtime: settings.runtime,
+                        provider_id: status.provider_id,
+                        available: status.available,
+                        loaded: status.runtime_ready,
+                        active_model: status.active_model,
+                        model_id: status.loaded_model_id,
+                        keep_loaded_secs: settings.keep_loaded_secs,
+                        runtime_source: Some(openless_core::FoundryRuntimeSource::from_legacy(
+                            &status.runtime_source,
+                        )),
+                        endpoint: status.endpoint,
+                        operation: None,
+                        error: status.error,
+                        last_error: None,
+                        last_prepare_ms: None,
+                        last_transcribe_ms: None,
+                        last_audio_ms: None,
+                    })
+                }
+                openless_core::LocalAsrRuntime::SherpaOnnx => {
+                    let status = sherpa.status_snapshot(&settings.active_model).await;
+                    Ok(openless_core::LocalAsrRuntimeStatus {
+                        restart_required: false,
+                        runtime: settings.runtime,
+                        provider_id: status.provider_id,
+                        available: status.available,
+                        loaded: status.runtime_ready,
+                        active_model: status.active_model,
+                        model_id: status.loaded_model_id,
+                        keep_loaded_secs: settings.keep_loaded_secs,
+                        runtime_source: None,
+                        endpoint: None,
+                        operation: None,
+                        error: status.error,
+                        last_error: status.last_error,
+                        last_prepare_ms: status.last_prepare_ms,
+                        last_transcribe_ms: status.last_transcribe_ms,
+                        last_audio_ms: status.last_audio_ms,
+                    })
+                }
+            }
+        })
+    }
+
+    fn prepare(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        runtime_source: openless_core::FoundryRuntimeSource,
+        model_dir: PathBuf,
+        progress: openless_core::ModelPrepareProgressSink,
+    ) -> BoxFuture<'static, Result<String, BackendError>> {
+        #[cfg(local_asr_sherpa)]
+        self.invalidate_scheduled_release(target.runtime);
+        let foundry = Arc::clone(&self.native.foundry);
+        let sherpa = Arc::clone(&self.native.sherpa);
+        let foundry_rebind_pending = Arc::clone(&self.foundry_rebind_pending);
+        Box::pin(async move {
+            let loaded = match target.runtime {
+                openless_core::LocalAsrRuntime::Foundry => {
+                    if foundry_rebind_pending.load(Ordering::Acquire) {
+                        return Err(BackendError::new(
+                            BackendErrorCode::InvalidState,
+                            "Foundry storage changed; restart is required",
+                        ));
+                    }
+                    let progress = Arc::clone(&progress);
+                    foundry
+                        .ensure_loaded_with_progress(
+                            target.model_id(),
+                            runtime_source.as_str(),
+                            move |payload| {
+                                let phase = match payload.phase {
+                                    crate::asr::local::foundry::FoundryPreparePhase::Runtime => {
+                                        openless_core::LocalAsrPreparePhase::Runtime
+                                    }
+                                    crate::asr::local::foundry::FoundryPreparePhase::Model => {
+                                        openless_core::LocalAsrPreparePhase::Model
+                                    }
+                                    crate::asr::local::foundry::FoundryPreparePhase::Load => {
+                                        openless_core::LocalAsrPreparePhase::Load
+                                    }
+                                    crate::asr::local::foundry::FoundryPreparePhase::Finished => {
+                                        openless_core::LocalAsrPreparePhase::Finished
+                                    }
+                                    crate::asr::local::foundry::FoundryPreparePhase::Failed => {
+                                        openless_core::LocalAsrPreparePhase::Failed
+                                    }
+                                };
+                                progress(openless_core::LocalAsrPrepareProgress {
+                                    runtime: openless_core::LocalAsrRuntimeKind::Foundry,
+                                    phase,
+                                    model_alias: payload.model_alias,
+                                    label: payload.label,
+                                    percent: payload.percent,
+                                    error: payload.error,
+                                });
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            local_asr_backend_error(
+                                BackendErrorCode::Platform,
+                                format!("{error:#}"),
+                            )
+                        })
+                }
+                openless_core::LocalAsrRuntime::SherpaOnnx => {
+                    let progress = Arc::clone(&progress);
+                    sherpa
+                        .ensure_loaded_with_progress(
+                            target.model_id(),
+                            model_dir.clone(),
+                            move |payload| {
+                                let phase = match payload.phase {
+                                    crate::asr::local::sherpa::SherpaPreparePhase::Runtime => {
+                                        openless_core::LocalAsrPreparePhase::Runtime
+                                    }
+                                    crate::asr::local::sherpa::SherpaPreparePhase::Model => {
+                                        openless_core::LocalAsrPreparePhase::Model
+                                    }
+                                    crate::asr::local::sherpa::SherpaPreparePhase::Load => {
+                                        openless_core::LocalAsrPreparePhase::Load
+                                    }
+                                    crate::asr::local::sherpa::SherpaPreparePhase::Finished => {
+                                        openless_core::LocalAsrPreparePhase::Finished
+                                    }
+                                    crate::asr::local::sherpa::SherpaPreparePhase::Failed => {
+                                        openless_core::LocalAsrPreparePhase::Failed
+                                    }
+                                };
+                                progress(openless_core::LocalAsrPrepareProgress {
+                                    runtime: openless_core::LocalAsrRuntimeKind::SherpaOnnx,
+                                    phase,
+                                    model_alias: payload.model_alias,
+                                    label: payload.label,
+                                    percent: payload.percent,
+                                    error: payload.error,
+                                });
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            local_asr_backend_error(
+                                BackendErrorCode::Platform,
+                                format!("{error:#}"),
+                            )
+                        })
+                }
+                openless_core::LocalAsrRuntime::Generic => return Err(BackendError::new(
+                    BackendErrorCode::Unsupported, "Legacy local ASR has been retired",
+                )),
+            }?;
+            let _ = model_dir;
+            Ok(loaded)
+        })
+    }
+
+    fn cancel_prepare(
+        &self,
+        runtime: openless_core::LocalAsrRuntime,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let result = match runtime {
+            openless_core::LocalAsrRuntime::Foundry => {
+                self.native.foundry.request_cancel_prepare();
+                Ok(())
+            }
+            openless_core::LocalAsrRuntime::SherpaOnnx => {
+                self.native.sherpa.request_cancel_prepare();
+                Ok(())
+            }
+            openless_core::LocalAsrRuntime::Generic => Err(BackendError::new(
+                BackendErrorCode::Unsupported,
+                "generic local ASR preload has no separate prepare cancellation",
+            )),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn release(
+        &self,
+        runtime: openless_core::LocalAsrRuntime,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        #[cfg(local_asr_sherpa)]
+        self.invalidate_scheduled_release(runtime);
+        let foundry = Arc::clone(&self.native.foundry);
+        let sherpa = Arc::clone(&self.native.sherpa);
+        Box::pin(async move {
+            match runtime {
+                openless_core::LocalAsrRuntime::Generic => Ok(()),
+                openless_core::LocalAsrRuntime::Foundry => {
+                    foundry.release_now().await.map_err(|error| {
+                        local_asr_backend_error(BackendErrorCode::Platform, format!("{error:#}"))
+                    })
+                }
+                openless_core::LocalAsrRuntime::SherpaOnnx => {
+                    sherpa.release_now().await.map_err(|error| {
+                        local_asr_backend_error(BackendErrorCode::Platform, format!("{error:#}"))
+                    })
+                }
+            }
+        })
+    }
+
+    fn preload(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        model_dir: PathBuf,
+        provider_type: String,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        self.preload_for_lease(target, model_dir, provider_type, None)
+    }
+
+    fn preload_lease(
+        &self,
+        lease: openless_core::LocalAsrRuntimeLease,
+        model_dir: PathBuf,
+        provider_type: String,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        self.preload_for_lease(
+            lease.target,
+            model_dir,
+            provider_type,
+            Some(lease.generation),
+        )
+    }
+
+    fn test_model_for_provider(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        model_dir: PathBuf,
+        provider_type: String,
+    ) -> BoxFuture<'static, Result<openless_core::LocalAsrTestResult, BackendError>> {
+        #[cfg(local_asr_sherpa)]
+        {
+            match target.runtime {
+                openless_core::LocalAsrRuntime::SherpaOnnx => {
+                    let sherpa = Arc::clone(&self.native.sherpa);
+                    Box::pin(test_sherpa_model(target, model_dir, provider_type, sherpa))
+                }
+                openless_core::LocalAsrRuntime::Foundry => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let foundry = Arc::clone(&self.native.foundry);
+                        Box::pin(test_foundry_model(target, provider_type, foundry))
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = (target, model_dir, provider_type);
+                        Box::pin(async {
+                            Err(BackendError::new(
+                                BackendErrorCode::Unsupported,
+                                "Foundry Local Whisper is not available on this platform",
+                            ))
+                        })
+                    }
+                }
+                openless_core::LocalAsrRuntime::Generic => {
+                    let _ = (target, model_dir, provider_type);
+                    Box::pin(async {
+                        Err(BackendError::new(
+                            BackendErrorCode::Unsupported,
+                            "legacy generic local ASR verification is not supported",
+                        ))
+                    })
+                }
+            }
+        }
+        #[cfg(not(local_asr_sherpa))]
+        {
+            let _ = (target, model_dir, provider_type);
+            Box::pin(async {
+                Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "native local ASR is not available on this platform",
+                ))
+            })
+        }
+    }
+
+    fn invalidate_route(&self, runtime: openless_core::LocalAsrRuntime) {
+        if runtime == openless_core::LocalAsrRuntime::Foundry {
+            self.native.foundry.invalidate_route();
+        }
+    }
+
+    #[cfg(local_asr_sherpa)]
+    fn invalidate_scheduled_release(&self, runtime: openless_core::LocalAsrRuntime) {
+        match runtime {
+            openless_core::LocalAsrRuntime::Foundry => &self.native.foundry_generation,
+            openless_core::LocalAsrRuntime::SherpaOnnx => &self.native.sherpa_generation,
+            openless_core::LocalAsrRuntime::Generic => return,
+        }
+        .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+const LOCAL_ASR_TEST_WAV: &[u8] = include_bytes!("../assets/local-asr-test.wav");
+
+#[cfg(all(local_asr_sherpa, target_os = "windows"))]
+async fn test_foundry_model(
+    target: openless_core::LocalAsrTarget,
+    provider_type: String,
+    foundry: Arc<crate::asr::local::FoundryLocalRuntime>,
+) -> Result<openless_core::LocalAsrTestResult, BackendError> {
+    if target.runtime != openless_core::LocalAsrRuntime::Foundry
+        || !matches!(
+            provider_type.as_str(),
+            "foundry-local" | "foundry-whisper" | "foundry-local-whisper"
+        )
+    {
+        return Err(BackendError::new(
+            BackendErrorCode::Unsupported,
+            "native Foundry channel verification requires a Foundry provider",
+        ));
+    }
+    let samples = crate::asr::local::test_run::decode_wav_16k_mono(LOCAL_ASR_TEST_WAV)
+        .map_err(|error| local_asr_backend_error(BackendErrorCode::Platform, error))?;
+    let audio_ms = samples.len() as u64 * 1_000 / 16_000;
+    let pcm = samples
+        .iter()
+        .flat_map(|sample| {
+            ((*sample * 32_768.0).clamp(-32_768.0, 32_767.0) as i16).to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let model_id = target.model_id().to_string();
+
+    let load_started = Instant::now();
+    foundry
+        .ensure_loaded(&model_id, "auto")
+        .await
+        .map_err(map_native_asr_error)?;
+    let load_ms = load_started.elapsed().as_millis() as u64;
+
+    let provider = crate::asr::local::FoundryLocalWhisperAsr::new(
+        Arc::clone(&foundry),
+        model_id,
+        "auto".into(),
+        None,
+    );
+    LegacyAudioConsumer::consume_pcm_chunk(&provider, &pcm);
+    let transcribe_started = Instant::now();
+    let result = provider
+        .transcribe_with_fallback_notice(std::time::Duration::from_secs(30), Arc::new(|_| {}))
+        .await
+        .map_err(map_native_asr_error);
+    if let Err(error) = foundry.release_now().await {
+        log::warn!("[local-asr-test] failed to release Foundry model: {error:#}");
+    }
+    let output = result?;
+    let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
+
+    Ok(openless_core::LocalAsrTestResult {
+        target,
+        backend: provider_type,
+        expected_text: "Hello. This is a test of the Voxtrail speech-to-text system.".into(),
+        transcribed_text: output.raw.text,
+        audio_ms,
+        load_ms,
+        transcribe_ms,
+    })
+}
+
+#[cfg(local_asr_sherpa)]
+async fn test_sherpa_model(
+    target: openless_core::LocalAsrTarget,
+    model_dir: PathBuf,
+    provider_type: String,
+    sherpa: Arc<crate::asr::local::SherpaOnnxRuntime>,
+) -> Result<openless_core::LocalAsrTestResult, BackendError> {
+    if target.runtime != openless_core::LocalAsrRuntime::SherpaOnnx
+        || !matches!(provider_type.as_str(), "sherpa-onnx" | "sherpa-onnx-local")
+    {
+        return Err(BackendError::new(
+            BackendErrorCode::Unsupported,
+            "native Sherpa channel verification requires a Sherpa provider",
+        ));
+    }
+    let samples = crate::asr::local::test_run::decode_wav_16k_mono(LOCAL_ASR_TEST_WAV)
+        .map_err(|error| local_asr_backend_error(BackendErrorCode::Platform, error))?;
+    let audio_ms = samples.len() as u64 * 1_000 / 16_000;
+    let pcm = samples
+        .iter()
+        .flat_map(|sample| {
+            ((*sample * 32_768.0).clamp(-32_768.0, 32_767.0) as i16).to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let model_id = target.model_id().to_string();
+
+    let load_started = Instant::now();
+    if let Err(error) = sherpa.ensure_loaded(&model_id, &model_dir).await {
+        if let Err(release_error) = sherpa.release_now().await {
+            log::warn!("[local-asr-test] failed to release Sherpa model: {release_error:#}");
+        }
+        return Err(map_native_asr_error(error));
+    }
+    let load_ms = load_started.elapsed().as_millis() as u64;
+
+    let transcribe_started = Instant::now();
+    let result = async {
+        let provider = crate::asr::local::SherpaOnnxAsr::new_for_model(
+            Arc::clone(&sherpa),
+            model_id,
+            model_dir,
+            None,
+            None,
+        )
+        .await
+        .map_err(map_native_asr_error)?;
+        LegacyAudioConsumer::consume_pcm_chunk(&provider, &pcm);
+        provider
+            .transcribe(std::time::Duration::from_secs(30))
+            .await
+            .map_err(map_native_asr_error)
+    }
+    .await;
+    if let Err(error) = sherpa.release_now().await {
+        log::warn!("[local-asr-test] failed to release Sherpa model: {error:#}");
+    }
+    let output = result?;
+    let transcribe_ms = transcribe_started.elapsed().as_millis() as u64;
+
+    Ok(openless_core::LocalAsrTestResult {
+        target,
+        backend: provider_type,
+        expected_text: "Hello. This is a test of the Voxtrail speech-to-text system.".into(),
+        transcribed_text: output.text,
+        audio_ms,
+        load_ms,
+        transcribe_ms,
+    })
+}
+
+impl TauriLocalAsrRuntimeAdapter {
+    fn preload_for_lease(
+        &self,
+        target: openless_core::LocalAsrTarget,
+        model_dir: PathBuf,
+        provider_type: String,
+        _activation_generation: Option<u64>,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        #[cfg(local_asr_sherpa)]
+        let foundry = Arc::clone(&self.native.foundry);
+        #[cfg(local_asr_sherpa)]
+        let sherpa = Arc::clone(&self.native.sherpa);
+        Box::pin(async move {
+            if target.runtime != openless_core::LocalAsrRuntime::Generic {
+                // On Windows prepare already finished loading; the unified preload phase only
+                // verifies the receipt. preload can also be called standalone, so the really
+                // loaded alias must be checked — never fake success, and never overturn a
+                // successful prepare with Unsupported like the old implementation did.
+                #[cfg(local_asr_sherpa)]
+                {
+                    let ready = match target.runtime {
+                        #[cfg(target_os = "windows")]
+                        openless_core::LocalAsrRuntime::Foundry => {
+                            foundry.is_loaded_for(target.model_id())
+                        }
+                        // Foundry is Windows-only; nothing is ever loaded for it elsewhere.
+                        #[cfg(not(target_os = "windows"))]
+                        openless_core::LocalAsrRuntime::Foundry => {
+                            let _ = &foundry;
+                            false
+                        }
+                        openless_core::LocalAsrRuntime::SherpaOnnx => {
+                            let status = sherpa.status_snapshot(target.model_id()).await;
+                            status.runtime_ready
+                                && status.loaded_model_id.as_deref() == Some(target.model_id())
+                        }
+                        openless_core::LocalAsrRuntime::Generic => unreachable!(),
+                    };
+                    return ready.then_some(()).ok_or_else(|| {
+                        BackendError::new(
+                            BackendErrorCode::InvalidState,
+                            "prepare the selected native ASR model before preload",
+                        )
+                    });
+                }
+                #[cfg(not(local_asr_sherpa))]
+                {
+                    return Err(BackendError::new(
+                        BackendErrorCode::Unsupported,
+                        "Foundry and Sherpa are not available on this platform",
+                    ));
+                }
+            }
+            let _ = model_dir;
+            Err(BackendError::new(
+                BackendErrorCode::Unsupported,
+                format!("generic local ASR provider is unavailable: {provider_type}"),
+            ))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TauriSelectionTarget {
+    target: crate::selection::SelectionInsertionTarget,
+    preview: bool,
+}
+
+#[cfg(not(mobile))]
+trait SelectionPlatformBridge: Send + Sync {
+    fn capture(
+        &self,
+    ) -> Result<
+        (
+            openless_core::SelectionCapture,
+            crate::selection::SelectionInsertionTarget,
+        ),
+        BackendError,
+    >;
+    fn apply(
+        &self,
+        target: &crate::selection::SelectionInsertionTarget,
+        source_text: &str,
+        replacement_text: &str,
+        reactivate: bool,
+    ) -> Result<InsertOutcome, BackendError>;
+    fn revert(
+        &self,
+        _target: &crate::selection::SelectionInsertionTarget,
+    ) -> Result<InsertOutcome, BackendError> {
+        Err(BackendError::new(
+            BackendErrorCode::Unsupported,
+            "selection replacement cannot be reverted by this platform adapter",
+        ))
+    }
+}
+
+#[cfg(not(mobile))]
+struct NativeSelectionPlatformBridge {
+    app: AppHandleSlot,
+}
+
+#[cfg(not(mobile))]
+impl NativeSelectionPlatformBridge {
+    fn preferences(&self) -> Result<openless_core::UserPreferences, BackendError> {
+        let app = self.app.lock().clone().ok_or_else(|| {
+            BackendError::new(
+                BackendErrorCode::InvalidState,
+                "Tauri AppHandle is not bound yet",
+            )
+        })?;
+        app.try_state::<Arc<openless_core::OpenLessBackend>>()
+            .map(|backend| backend.get_preferences())
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::InvalidState,
+                    "core backend state is unavailable",
+                )
+            })
+    }
+}
+
+#[cfg(not(mobile))]
+impl SelectionPlatformBridge for NativeSelectionPlatformBridge {
+    fn capture(
+        &self,
+    ) -> Result<
+        (
+            openless_core::SelectionCapture,
+            crate::selection::SelectionInsertionTarget,
+        ),
+        BackendError,
+    > {
+        let (selection, target) = crate::selection::resolve_selection_workspace_capture();
+        let selection = selection.ok_or_else(|| {
+            BackendError::new(
+                BackendErrorCode::InvalidArgument,
+                "selectionPolishNoSelection",
+            )
+        })?;
+        // A head/tail stand-in must never become the source of a paste. The
+        // final validation also compares against the full live selection, but
+        // refusing here avoids sending the omitted middle's absence to the model.
+        if selection.omits_middle {
+            return Err(BackendError::new(
+                BackendErrorCode::InvalidArgument,
+                "selectionPolishSelectionTooLong",
+            ));
+        }
+        if !crate::selection::selection_insertion_target_is_captured(&target) {
+            return Err(BackendError::new(
+                BackendErrorCode::Platform,
+                "selectionPolishTargetUnavailable",
+            ));
+        }
+        Ok((
+            openless_core::SelectionCapture {
+                text: selection.text,
+                source_app: selection.source_app,
+            },
+            target,
+        ))
+    }
+
+    fn apply(
+        &self,
+        target: &crate::selection::SelectionInsertionTarget,
+        source_text: &str,
+        replacement_text: &str,
+        reactivate: bool,
+    ) -> Result<InsertOutcome, BackendError> {
+        if reactivate && !crate::selection::reactivate_selection_insertion_target(target) {
+            return Err(BackendError::new(
+                BackendErrorCode::Platform,
+                "selectionPolishTargetUnavailable",
+            ));
+        }
+        if crate::selection::is_truncated_selection_stand_in(source_text) {
+            return Err(BackendError::new(
+                BackendErrorCode::InvalidArgument,
+                "selectionPolishSelectionTooLong",
+            ));
+        }
+        let validation = crate::selection::validate_selection_insertion_target(target, source_text);
+        if let Some(code) = validation.error_code() {
+            let error_code = match validation {
+                crate::selection::SelectionInsertionTargetValidation::TargetUnavailable => {
+                    BackendErrorCode::Platform
+                }
+                crate::selection::SelectionInsertionTargetValidation::TargetChanged
+                | crate::selection::SelectionInsertionTargetValidation::SelectionChanged => {
+                    BackendErrorCode::Cancelled
+                }
+                crate::selection::SelectionInsertionTargetValidation::Valid => unreachable!(),
+            };
+            return Err(BackendError::new(error_code, code));
+        }
+        // Final line of defense right before pasting: during validate's simulate_copy fallback
+        // the foreground focus may have jumped away (if the other app happens to expose the same
+        // text, the text comparison lets it through). Re-check that the app captured at capture
+        // time is still foreground; if not, refuse.
+        #[cfg(target_os = "macos")]
+        if !crate::selection::selection_target_still_front(target) {
+            return Err(BackendError::new(
+                BackendErrorCode::Cancelled,
+                "selectionPolishTargetChanged",
+            ));
+        }
+        let preferences = self.preferences()?;
+        map_insert_status(crate::insertion::TextInserter::new().insert(
+            replacement_text,
+            preferences.restore_clipboard_after_paste,
+            preferences.paste_shortcut,
+        ))
+    }
+}
+
+#[cfg(not(mobile))]
+struct TauriSelectionRuntime {
+    bridge: Arc<dyn SelectionPlatformBridge>,
+    targets: Arc<Mutex<HashMap<SessionId, TauriSelectionTarget>>>,
+}
+
+#[cfg(not(mobile))]
+impl TauriSelectionRuntime {
+    fn new(app: AppHandleSlot) -> Self {
+        Self::with_bridge(Arc::new(NativeSelectionPlatformBridge { app }))
+    }
+
+    fn with_bridge(bridge: Arc<dyn SelectionPlatformBridge>) -> Self {
+        Self {
+            bridge,
+            targets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[cfg(not(mobile))]
+impl openless_core::SelectionRuntimeAdapter for TauriSelectionRuntime {
+    fn capture(
+        &self,
+        session_id: SessionId,
+        supplied_text: Option<String>,
+    ) -> BoxFuture<'static, Result<openless_core::SelectionCapture, BackendError>> {
+        if supplied_text.is_some() {
+            return Box::pin(async {
+                Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "Tauri selection capture does not accept injected text",
+                ))
+            });
+        }
+        let bridge = Arc::clone(&self.bridge);
+        let targets = Arc::clone(&self.targets);
+        Box::pin(async move {
+            let (capture, target) = bridge.capture()?;
+            let mut targets = targets.lock();
+            if targets.contains_key(&session_id) {
+                return Err(BackendError::new(
+                    BackendErrorCode::Busy,
+                    "selection target is already registered for this session",
+                ));
+            }
+            targets.clear();
+            targets.insert(
+                session_id,
+                TauriSelectionTarget {
+                    target,
+                    preview: false,
+                },
+            );
+            Ok(capture)
+        })
+    }
+
+    fn apply(
+        &self,
+        session_id: SessionId,
+        source_text: String,
+        replacement_text: String,
+    ) -> BoxFuture<'static, Result<InsertOutcome, BackendError>> {
+        let bridge = Arc::clone(&self.bridge);
+        let targets = Arc::clone(&self.targets);
+        Box::pin(async move {
+            let target = targets.lock().get(&session_id).cloned().ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "selection target is no longer active",
+                )
+            })?;
+            bridge.apply(
+                &target.target,
+                &source_text,
+                &replacement_text,
+                target.preview,
+            )
+        })
+    }
+
+    fn prepare_preview(
+        &self,
+        session_id: SessionId,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let targets = Arc::clone(&self.targets);
+        Box::pin(async move {
+            let mut targets = targets.lock();
+            let target = targets.get_mut(&session_id).ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "selection target is no longer active",
+                )
+            })?;
+            target.preview = true;
+            Ok(())
+        })
+    }
+
+    fn revert(
+        &self,
+        session_id: SessionId,
+    ) -> BoxFuture<'static, Result<InsertOutcome, BackendError>> {
+        let bridge = Arc::clone(&self.bridge);
+        let targets = Arc::clone(&self.targets);
+        Box::pin(async move {
+            let target = targets.lock().get(&session_id).cloned().ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "selection target is no longer active",
+                )
+            })?;
+            bridge.revert(&target.target)
+        })
+    }
+
+    fn cancel(&self, session_id: SessionId) -> BoxFuture<'static, Result<(), BackendError>> {
+        let targets = Arc::clone(&self.targets);
+        Box::pin(async move {
+            targets.lock().remove(&session_id);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(mobile))]
+struct TauriRemoteInputRuntimeAdapter {
+    app: AppHandleSlot,
+    server: Arc<tokio::sync::Mutex<Option<crate::remote_server::RemoteServerHandle>>>,
+}
+
+#[cfg(not(mobile))]
+impl TauriRemoteInputRuntimeAdapter {
+    fn new(app: AppHandleSlot) -> Self {
+        Self {
+            app,
+            server: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    fn app_handle(&self) -> Result<AppHandle, BackendError> {
+        self.app.lock().clone().ok_or_else(|| {
+            BackendError::new(
+                BackendErrorCode::InvalidState,
+                "Tauri app handle is not available",
+            )
+        })
+    }
+
+    fn backend(&self) -> Result<Arc<openless_core::OpenLessBackend>, BackendError> {
+        let app = self.app_handle()?;
+        app.try_state::<Arc<openless_core::OpenLessBackend>>()
+            .map(|backend| Arc::clone(&*backend))
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::InvalidState,
+                    "core backend state is unavailable",
+                )
+            })
+    }
+}
+
+#[cfg(not(mobile))]
+impl openless_core::RemoteInputRuntimeAdapter for TauriRemoteInputRuntimeAdapter {
+    fn load_pairing_pin(
+        &self,
+    ) -> BoxFuture<'static, Result<Option<openless_core::SecretValue>, BackendError>> {
+        let app = self.app_handle();
+        Box::pin(async move {
+            let app = app?;
+            crate::remote_server::load_or_create_pin(&app)
+                .map(openless_core::SecretValue::new)
+                .map(Some)
+                .map_err(|error| {
+                    BackendError::new(
+                        BackendErrorCode::Persistence,
+                        format!("persist pairing PIN failed: {error}"),
+                    )
+                })
+        })
+    }
+
+    fn persist_pairing_pin(
+        &self,
+        pin: openless_core::SecretValue,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let app = self.app_handle();
+        Box::pin(async move {
+            crate::remote_server::save_pin(&app?, pin.expose_secret()).map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Persistence,
+                    format!("persist pairing PIN failed: {error}"),
+                )
+            })
+        })
+    }
+
+    fn start_server(
+        &self,
+        config: openless_core::RemoteInputServerConfig,
+    ) -> BoxFuture<'static, Result<openless_core::RemoteInputServerBinding, BackendError>> {
+        let app = self.app_handle();
+        let server = Arc::clone(&self.server);
+        Box::pin(async move {
+            let app = app?;
+            let backend = app
+                .try_state::<Arc<openless_core::OpenLessBackend>>()
+                .map(|backend| Arc::clone(&*backend))
+                .ok_or_else(|| {
+                    BackendError::new(
+                        BackendErrorCode::InvalidState,
+                        "core backend state is unavailable",
+                    )
+                })?;
+            let handle = crate::remote_server::start(crate::remote_server::RemoteServerConfig {
+                port: config.port,
+                backend,
+                app,
+            })
+            .await
+            .map_err(|message| BackendError::new(BackendErrorCode::Platform, message))?;
+            let binding = openless_core::RemoteInputServerBinding {
+                port: handle.bound_port,
+                urls: crate::remote_server::access_urls(handle.bound_port),
+                urls_stale: false,
+                ca_fingerprint_sha256: Some(handle.ca_fingerprint_sha256.clone()),
+            };
+            *server.lock().await = Some(handle);
+            Ok(binding)
+        })
+    }
+
+    fn stop_server(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let server = Arc::clone(&self.server);
+        Box::pin(async move {
+            if let Some(handle) = server.lock().await.take() {
+                handle.shutdown().await;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_local_ips(&self) -> BoxFuture<'static, Result<Vec<String>, BackendError>> {
+        Box::pin(async {
+            Ok(crate::remote_server::local_lan_ipv4s()
+                .iter()
+                .map(ToString::to_string)
+                .collect())
+        })
+    }
+
+    fn start_audio_session(
+        &self,
+        insert_text: bool,
+    ) -> BoxFuture<'static, Result<openless_core::SessionId, BackendError>> {
+        let backend = self.backend();
+        Box::pin(async move {
+            let backend = backend?;
+            if !backend.snapshot().running {
+                backend.start().await?;
+            }
+            backend
+                .start_external_dictation_with_options(openless_core::DictationStartOptions {
+                    insert_text,
+                    ..openless_core::DictationStartOptions::default()
+                })
+                .await
+        })
+    }
+
+    fn feed_audio(
+        &self,
+        session_id: openless_core::SessionId,
+        pcm_s16le: Vec<u8>,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let backend = self.backend();
+        Box::pin(async move { backend?.feed_external_pcm(session_id, &pcm_s16le) })
+    }
+
+    fn stop_audio_session(
+        &self,
+        session_id: openless_core::SessionId,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let backend = self.backend();
+        Box::pin(async move {
+            backend?
+                .stop_dictation_session(session_id)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn cancel_audio_session(
+        &self,
+        session_id: openless_core::SessionId,
+    ) -> BoxFuture<'static, Result<(), BackendError>> {
+        let backend = self.backend();
+        Box::pin(async move { backend?.cancel_dictation(Some(session_id)).await })
+    }
+
+    fn read_audio_history(
+        &self,
+        session_id: SessionId,
+    ) -> BoxFuture<'static, Result<Option<openless_core::DictationSession>, BackendError>> {
+        let backend = self.backend();
+        Box::pin(async move {
+            Ok(backend?
+                .list_history()?
+                .into_iter()
+                .find(|entry| entry.id == session_id.to_string()))
+        })
+    }
+}
+
+struct TauriPlatformApi {
+    app: AppHandleSlot,
+    hotkey_status: Arc<Mutex<openless_core::HotkeyStatus>>,
+}
+
+impl TauriPlatformApi {
+    fn new(app: AppHandleSlot, hotkey_status: Arc<Mutex<openless_core::HotkeyStatus>>) -> Self {
+        Self { app, hotkey_status }
+    }
+
+    fn app_handle(&self) -> Result<AppHandle, BackendError> {
+        self.app.lock().clone().ok_or_else(|| {
+            BackendError::new(
+                BackendErrorCode::InvalidState,
+                "Tauri app handle is not available",
+            )
+        })
+    }
+}
+
+fn map_permission_state(
+    status: crate::permissions::PermissionStatus,
+) -> openless_core::PermissionState {
+    match status {
+        crate::permissions::PermissionStatus::Granted => openless_core::PermissionState::Granted,
+        crate::permissions::PermissionStatus::Denied => openless_core::PermissionState::Denied,
+        crate::permissions::PermissionStatus::NotDetermined => {
+            openless_core::PermissionState::Unknown
+        }
+        crate::permissions::PermissionStatus::Restricted => {
+            openless_core::PermissionState::Restricted
+        }
+        crate::permissions::PermissionStatus::NotApplicable => {
+            openless_core::PermissionState::Unsupported
+        }
+        crate::permissions::PermissionStatus::NoDevice => openless_core::PermissionState::NoDevice,
+    }
+}
+
+fn current_permission_snapshot() -> openless_core::PermissionSnapshot {
+    openless_core::PermissionSnapshot {
+        microphone: map_permission_state(crate::permissions::check_microphone()),
+        accessibility: map_permission_state(crate::permissions::check_accessibility()),
+    }
+}
+
+impl openless_core::PlatformApi for TauriPlatformApi {
+    fn capabilities(
+        &self,
+    ) -> BoxFuture<'static, Result<openless_core::PlatformCapabilities, BackendError>> {
+        Box::pin(async { Ok(openless_core::PlatformCapabilities::current()) })
+    }
+
+    fn microphone_devices(
+        &self,
+    ) -> BoxFuture<'static, Result<Vec<openless_core::MicrophoneDevice>, BackendError>> {
+        Box::pin(async move {
+            #[cfg(mobile)]
+            {
+                Ok(Vec::new())
+            }
+            #[cfg(not(mobile))]
+            {
+                let devices =
+                    tauri::async_runtime::spawn_blocking(crate::recorder::list_input_devices)
+                        .await
+                        .map_err(map_tauri_error)?
+                        .map_err(map_recorder_error)?;
+                Ok(devices
+                    .into_iter()
+                    .map(|device| openless_core::MicrophoneDevice {
+                        id: device.name.clone(),
+                        name: device.name,
+                        is_default: device.is_default,
+                    })
+                    .collect())
+            }
+        })
+    }
+
+    fn microphone_permission(
+        &self,
+    ) -> BoxFuture<'static, Result<openless_core::PermissionSnapshot, BackendError>> {
+        Box::pin(async { Ok(current_permission_snapshot()) })
+    }
+
+    fn accessibility_permission(
+        &self,
+    ) -> BoxFuture<'static, Result<openless_core::PermissionSnapshot, BackendError>> {
+        Box::pin(async { Ok(current_permission_snapshot()) })
+    }
+
+    fn request_microphone_permission(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let app = self.app_handle();
+        Box::pin(async move {
+            let app = app?;
+            let _ = crate::request_microphone_from_foreground(&app);
+            Ok(())
+        })
+    }
+
+    fn request_accessibility_permission(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        Box::pin(async {
+            let _ = crate::permissions::request_accessibility();
+            Ok(())
+        })
+    }
+
+    fn hotkey_status(
+        &self,
+    ) -> BoxFuture<'static, Result<openless_core::HotkeyStatus, BackendError>> {
+        #[cfg(mobile)]
+        {
+            Box::pin(async {
+                Ok(openless_core::HotkeyStatus {
+                    adapter: crate::types::HotkeyAdapterKind::Unavailable,
+                    state: crate::types::HotkeyStatusState::Failed,
+                    message: Some("移动端不支持全局热键".into()),
+                    last_error: Some(crate::types::HotkeyInstallError {
+                        code: "unavailable".into(),
+                        message: "Global hotkeys are not available on mobile".into(),
+                    }),
+                })
+            })
+        }
+        #[cfg(not(mobile))]
+        {
+            let hotkey_status = Arc::clone(&self.hotkey_status);
+            Box::pin(async move { Ok(hotkey_status.lock().clone()) })
+        }
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+struct TauriNativeTranscriptionEngine {
+    dependencies: TauriNativeAsrDependencies,
+    model_store: Option<Arc<openless_core::ModelStore>>,
+    #[cfg(local_asr_sherpa)]
+    backend: BackendSlot,
+}
+
+#[cfg(local_asr_sherpa)]
+impl TauriNativeTranscriptionEngine {
+    fn new(
+        dependencies: TauriNativeAsrDependencies,
+        model_store: Option<Arc<openless_core::ModelStore>>,
+        _backend: BackendSlot,
+    ) -> Self {
+        Self {
+            dependencies,
+            model_store,
+            #[cfg(local_asr_sherpa)]
+            backend: _backend,
+        }
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+#[derive(Clone)]
+enum TauriNativeTranscriptionSessionKind {
+    #[cfg(local_asr_sherpa)]
+    Foundry {
+        provider: Arc<crate::asr::local::FoundryLocalWhisperAsr>,
+        runtime: Arc<crate::asr::local::FoundryLocalRuntime>,
+    },
+    #[cfg(local_asr_sherpa)]
+    Sherpa {
+        provider: Arc<crate::asr::local::SherpaOnnxAsr>,
+        runtime: Arc<crate::asr::local::SherpaOnnxRuntime>,
+    },
+}
+
+#[cfg(local_asr_sherpa)]
+#[derive(Clone)]
+struct TauriNativeTranscriptionSession {
+    kind: TauriNativeTranscriptionSessionKind,
+    asr_call_label: openless_core::AsrCallLabel,
+    #[cfg(local_asr_sherpa)]
+    backend: BackendSlot,
+    #[cfg(local_asr_sherpa)]
+    session_id: SessionId,
+    #[cfg(local_asr_sherpa)]
+    generation: u64,
+    #[cfg(local_asr_sherpa)]
+    current_generation: Arc<AtomicU64>,
+    keep_loaded_secs: u32,
+    released: Arc<AtomicBool>,
+}
+
+#[cfg(local_asr_sherpa)]
+enum NativeStartReleaseRuntime {
+    Foundry(Arc<crate::asr::local::FoundryLocalRuntime>),
+    Sherpa(Arc<crate::asr::local::SherpaOnnxRuntime>),
+}
+
+#[cfg(local_asr_sherpa)]
+struct NativeStartReleaseGuard {
+    runtime: NativeStartReleaseRuntime,
+    keep_loaded_secs: u32,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+    armed: bool,
+}
+
+#[cfg(local_asr_sherpa)]
+impl NativeStartReleaseGuard {
+    fn new(
+        runtime: NativeStartReleaseRuntime,
+        keep_loaded_secs: u32,
+        generation: u64,
+        current_generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            runtime,
+            keep_loaded_secs,
+            generation,
+            current_generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+impl Drop for NativeStartReleaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match &self.runtime {
+            NativeStartReleaseRuntime::Foundry(runtime) => schedule_foundry_release(
+                Arc::clone(runtime),
+                None,
+                self.keep_loaded_secs,
+                self.generation,
+                Arc::clone(&self.current_generation),
+            ),
+            NativeStartReleaseRuntime::Sherpa(runtime) => schedule_sherpa_release(
+                Arc::clone(runtime),
+                self.keep_loaded_secs,
+                self.generation,
+                Arc::clone(&self.current_generation),
+            ),
+        }
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+impl TranscriptionEngine for TauriNativeTranscriptionEngine {
+    fn start(
+        &self,
+        _session_id: SessionId,
+        context: Arc<DictationContext>,
+        partials: Arc<dyn TextStreamSink>,
+    ) -> BoxFuture<'static, Result<Arc<dyn TranscriptionSession>, BackendError>> {
+        // The two Windows runtimes count generations independently; switching to Sherpa must not
+        // permanently invalidate Foundry's release. Settings-page prepare/release also shares
+        // these generations: an old session must not unload a newly enabled model.
+        #[cfg(local_asr_sherpa)]
+        let current_generation = Arc::clone(
+            if context.asr.provider_type == openless_core::LocalAsrRuntime::Foundry.provider_id() {
+                &self.dependencies.foundry_generation
+            } else {
+                &self.dependencies.sherpa_generation
+            },
+        );
+        let keep_loaded_secs = context.asr.keep_loaded_secs.unwrap_or(0);
+
+        #[cfg(local_asr_sherpa)]
+        let foundry = Arc::clone(&self.dependencies.foundry);
+        #[cfg(local_asr_sherpa)]
+        let backend = Arc::clone(&self.backend);
+        #[cfg(local_asr_sherpa)]
+        let sherpa = Arc::clone(&self.dependencies.sherpa);
+        let model_store = self.model_store.clone();
+
+        Box::pin(async move {
+            let provider_type = context.asr.provider_type.as_str();
+            let generation = current_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let release_runtime = if provider_type
+                == openless_core::LocalAsrRuntime::Foundry.provider_id()
+            {
+                NativeStartReleaseRuntime::Foundry(Arc::clone(&foundry))
+            } else {
+                NativeStartReleaseRuntime::Sherpa(Arc::clone(&sherpa))
+            };
+            let mut start_release_guard = NativeStartReleaseGuard::new(
+                release_runtime,
+                keep_loaded_secs,
+                generation,
+                Arc::clone(&current_generation),
+            );
+            #[cfg(local_asr_sherpa)]
+            let (kind, label_model) = if provider_type
+                == openless_core::LocalAsrRuntime::Foundry.provider_id()
+            {
+                let model = context
+                    .asr
+                    .model
+                    .clone()
+                    .filter(|model| {
+                        openless_core::LocalAsrTarget::parse(
+                            openless_core::LocalAsrRuntime::Foundry,
+                            model,
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or_else(|| {
+                        openless_core::LocalAsrRuntime::Foundry
+                            .default_model()
+                            .to_string()
+                    });
+                (
+                    TauriNativeTranscriptionSessionKind::Foundry {
+                        // Foundry is never registered off Windows (see backend_dependencies);
+                        // the non-Windows constructor only keeps this branch compiling there.
+                        #[cfg(target_os = "windows")]
+                        provider: Arc::new(crate::asr::local::FoundryLocalWhisperAsr::new(
+                            Arc::clone(&foundry),
+                            model.clone(),
+                            context
+                                .asr
+                                .runtime
+                                .clone()
+                                .unwrap_or_else(|| "auto".to_string()),
+                            context.asr.language.clone(),
+                        )),
+                        #[cfg(not(target_os = "windows"))]
+                        provider: Arc::new(crate::asr::local::FoundryLocalWhisperAsr::new(
+                            model.clone(),
+                            context.asr.language.clone(),
+                        )),
+                        runtime: foundry,
+                    },
+                    Some(model),
+                )
+            } else if matches!(provider_type, "sherpa-onnx-local" | "sherpa-onnx") {
+                let model = context
+                    .asr
+                    .model
+                    .clone()
+                    .filter(|model| {
+                        openless_core::LocalAsrTarget::parse(
+                            openless_core::LocalAsrRuntime::SherpaOnnx,
+                            model,
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or_else(|| {
+                        openless_core::LocalAsrRuntime::SherpaOnnx
+                            .default_model()
+                            .to_string()
+                    });
+                let token_sink = Arc::clone(&partials);
+                let token_offset = Arc::new(AtomicU64::new(0));
+                let handler_offset = Arc::clone(&token_offset);
+                let token_handler = Arc::new(move |piece: String| {
+                    let offset =
+                        handler_offset.fetch_add(piece.chars().count() as u64, Ordering::AcqRel);
+                    if let Err(error) = token_sink.publish(TextStreamChunk {
+                        text: piece,
+                        offset,
+                    }) {
+                        log::warn!("[core-adapter] publish sherpa partial failed: {error}");
+                    }
+                });
+                let target = openless_core::LocalAsrTarget::parse(
+                    openless_core::LocalAsrRuntime::SherpaOnnx,
+                    model.clone(),
+                )?;
+                let store = model_store.as_ref().ok_or_else(|| {
+                    BackendError::new(
+                        BackendErrorCode::Unsupported,
+                        "Core model store is unavailable",
+                    )
+                })?;
+                if !store.is_installed(&target)? {
+                    return Err(BackendError::new(
+                        BackendErrorCode::InvalidState,
+                        "Sherpa model is not downloaded",
+                    ));
+                }
+                let model_dir = store.runtime_model_dir(&target)?;
+                let provider = crate::asr::local::SherpaOnnxAsr::new_for_model(
+                    Arc::clone(&sherpa),
+                    model.clone(),
+                    model_dir,
+                    context.asr.language.clone(),
+                    Some(token_handler),
+                )
+                .await
+                .map_err(map_native_asr_error)?;
+                (
+                    TauriNativeTranscriptionSessionKind::Sherpa {
+                        provider: Arc::new(provider),
+                        runtime: sherpa,
+                    },
+                    Some(model),
+                )
+            } else {
+                return Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    format!("native ASR provider is unavailable: {provider_type}"),
+                ));
+            };
+
+            #[cfg(local_asr_sherpa)]
+            let _ = partials;
+
+            let asr_call_label =
+                openless_core::AsrCallLabel::new(context.asr.provider_type.clone(), label_model);
+
+            let session = Arc::new(TauriNativeTranscriptionSession {
+                kind,
+                asr_call_label,
+                #[cfg(local_asr_sherpa)]
+                backend,
+                #[cfg(local_asr_sherpa)]
+                session_id: _session_id,
+                #[cfg(local_asr_sherpa)]
+                generation,
+                #[cfg(local_asr_sherpa)]
+                current_generation,
+                keep_loaded_secs,
+                released: Arc::new(AtomicBool::new(false)),
+            });
+            // A dropped native start future is cleaned by NativeStartReleaseGuard. Once the
+            // session exists, its finish/cancel path owns the same generation and release.
+            start_release_guard.disarm();
+            Ok(session as Arc<dyn TranscriptionSession>)
+        })
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+impl CoreAudioConsumer for TauriNativeTranscriptionSession {
+    fn consume_pcm_chunk(&self, pcm: &[u8]) {
+        match &self.kind {
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Foundry { provider, .. } => {
+                LegacyAudioConsumer::consume_pcm_chunk(provider.as_ref(), pcm);
+            }
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Sherpa { provider, .. } => {
+                LegacyAudioConsumer::consume_pcm_chunk(provider.as_ref(), pcm);
+            }
+        }
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+impl TranscriptionSession for TauriNativeTranscriptionSession {
+    fn asr_call_label(&self) -> Option<openless_core::AsrCallLabel> {
+        Some(self.asr_call_label.clone())
+    }
+
+    fn finish(&self) -> BoxFuture<'static, Result<TranscriptOutput, BackendError>> {
+        #[cfg(local_asr_sherpa)]
+        use crate::asr::local::foundry_runtime as foundry;
+
+        let session = self.clone();
+        let kind = self.kind.clone();
+        Box::pin(async move {
+            #[cfg(local_asr_sherpa)]
+            let mut recovery = None;
+            // Don't arrange the release before each branch's `?`: all results flow through this
+            // one point. cancel and finish may run concurrently; `released` guarantees resource
+            // teardown is arranged only once, and an old generation can't clear a new session.
+            let result = async {
+            let output = match kind {
+                #[cfg(local_asr_sherpa)]
+                TauriNativeTranscriptionSessionKind::Foundry { provider, .. } => {
+                    let timeout = openless_core::provider_rules::native_transcribe_timeout(
+                        "foundry-local-whisper", provider.buffer_duration_ms());
+                    let result = match provider
+                        .transcribe_with_fallback_notice(
+                            timeout,
+                            foundry_transcription_notices(
+                                Arc::clone(&session.backend),
+                                session.session_id,
+                                Arc::clone(&session.released),
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error)
+                            if foundry::is_terminal_foundry_fallback_error(
+                                &error,
+                            ) =>
+                        {
+                            log::error!(
+                                "[core-adapter] Foundry retranscription reached terminal fallback error: {error:#}"
+                            );
+                            #[cfg(target_os = "windows")]
+                            let message = foundry::FOUNDRY_FALLBACK_TERMINAL_USER_MESSAGE;
+                            #[cfg(not(target_os = "windows"))]
+                            let message = "Foundry is only available on Windows";
+                            let mut backend_error = BackendError::new(
+                                BackendErrorCode::Provider,
+                                message,
+                            );
+                            backend_error.details = Some(serde_json::json!({
+                                "terminal": "foundry_fallback"
+                            }));
+                            return Err(backend_error);
+                        }
+                        Err(error) => return Err(map_native_asr_error(error).retryable(true)),
+                    };
+                    recovery = result.primary_recovery;
+                    result.raw
+                }
+                #[cfg(local_asr_sherpa)]
+                TauriNativeTranscriptionSessionKind::Sherpa { provider, .. } => {
+                    let timeout = openless_core::provider_rules::native_transcribe_timeout(
+                        "sherpa-onnx-local", provider.buffer_duration_ms());
+                    let output = provider
+                        .transcribe(timeout)
+                        .await
+                        .map_err(map_native_asr_error)?;
+                    output
+                }
+            };
+            Ok(TranscriptOutput {
+                text: output.text,
+                duration_ms: output.duration_ms,
+            })
+            }.await;
+            if result.is_err() {
+                session.cancel_native();
+            }
+            #[cfg(local_asr_sherpa)]
+            session.release_native(result.is_err(), recovery);
+            result
+        })
+    }
+
+    fn cancel(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let session = self.clone();
+        Box::pin(async move {
+            session.cancel_native();
+            #[cfg(local_asr_sherpa)]
+            session.release_native(true, None);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(local_asr_sherpa)]
+fn foundry_transcription_notices(
+    backend: BackendSlot,
+    session_id: SessionId,
+    released: Arc<AtomicBool>,
+) -> crate::asr::local::foundry_runtime::FoundryFallbackNoticeCallback {
+    Arc::new(move |notice| {
+        // Feed directly into the same Core event stream: a first CPU download can take very
+        // long, so the notice can't wait for finish to return. The callback holds only a Weak
+        // Backend; finish/failure/cancel share the `released` teardown.
+        if released.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(backend) = backend.lock().as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        backend.event_publisher().publish(
+            Some(session_id),
+            openless_core::BackendEventKind::Notification(openless_core::NotificationPayload {
+                level: openless_core::NotificationLevel::Warning,
+                message: notice.message().into(),
+            }),
+        );
+    })
+}
+
+#[cfg(local_asr_sherpa)]
+impl TauriNativeTranscriptionSession {
+    fn cancel_native(&self) {
+        match &self.kind {
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Foundry { provider, .. } => provider.cancel(),
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Sherpa { provider, .. } => provider.cancel(),
+        }
+    }
+
+    fn release_native(
+        &self,
+        discard: bool,
+        #[cfg(local_asr_sherpa)] recovery: Option<
+            crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken,
+        >,
+    ) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        match &self.kind {
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Foundry { runtime, .. } => {
+                schedule_foundry_release(
+                    Arc::clone(runtime),
+                    recovery,
+                    self.keep_loaded_secs,
+                    self.generation,
+                    Arc::clone(&self.current_generation),
+                );
+            }
+            #[cfg(local_asr_sherpa)]
+            TauriNativeTranscriptionSessionKind::Sherpa { runtime, .. } => {
+                schedule_sherpa_release(
+                    Arc::clone(runtime),
+                    self.keep_loaded_secs,
+                    self.generation,
+                    Arc::clone(&self.current_generation),
+                );
+            }
+        }
+        let _ = discard;
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", local_asr_sherpa, test))]
+fn local_asr_release_delay(keep_loaded_secs: u32) -> Option<std::time::Duration> {
+    (keep_loaded_secs != openless_core::LOCAL_ASR_KEEP_LOADED_FOREVER_SECS)
+        .then(|| std::time::Duration::from_secs(keep_loaded_secs as u64))
+}
+
+#[cfg(local_asr_sherpa)]
+fn schedule_foundry_release(
+    runtime: Arc<crate::asr::local::FoundryLocalRuntime>,
+    recovery: Option<crate::asr::local::foundry_runtime::FoundryPrimaryRecoveryToken>,
+    keep_loaded_secs: u32,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+) {
+    // Foundry only runs on Windows; elsewhere there is never a loaded Foundry model to release.
+    #[cfg(not(target_os = "windows"))]
+    let _ = (runtime, recovery, keep_loaded_secs, generation, current_generation);
+    #[cfg(target_os = "windows")]
+    tauri::async_runtime::spawn(async move {
+        if current_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Some(recovery) = recovery.as_ref() {
+            if keep_loaded_secs > 0 {
+                if !runtime
+                    .restore_primary_for_keep_alive(recovery)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+        }
+        let Some(delay) = local_asr_release_delay(keep_loaded_secs) else {
+            return;
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if current_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let result = match recovery.as_ref() {
+            Some(recovery) => runtime
+                .release_primary_if_current(recovery)
+                .await
+                .map(|_| ()),
+            None => runtime
+                .release_if_generation(&current_generation, generation)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(error) = result {
+            log::warn!("[core-adapter] release Foundry runtime failed: {error:#}");
+        }
+    });
+}
+
+#[cfg(local_asr_sherpa)]
+fn schedule_sherpa_release(
+    runtime: Arc<crate::asr::local::SherpaOnnxRuntime>,
+    keep_loaded_secs: u32,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+) {
+    let Some(delay) = local_asr_release_delay(keep_loaded_secs) else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if current_generation.load(Ordering::Acquire) == generation {
+            if let Err(error) = runtime
+                .release_if_generation(&current_generation, generation)
+                .await
+            {
+                log::warn!("[core-adapter] release sherpa runtime failed: {error:#}");
+            }
+        }
+    });
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", local_asr_sherpa))]
+fn map_native_asr_error(error: impl std::fmt::Display) -> BackendError {
+    BackendError::new(
+        BackendErrorCode::Provider,
+        format!("native ASR provider failed: {error}"),
+    )
+}
+
+pub(crate) struct TauriAudioRecorder {
+    app: AppHandleSlot,
+    backend: BackendSlot,
+    warm_hub: Arc<WarmCaptureHub>,
+}
+
+struct AudioConsumerBridge {
+    inner: Arc<dyn CoreAudioConsumer>,
+}
+
+impl LegacyAudioConsumer for AudioConsumerBridge {
+    fn consume_pcm_chunk(&self, pcm: &[u8]) {
+        self.inner.consume_pcm_chunk(pcm);
+    }
+}
+
+enum TauriStagedCapture {
+    Cold(StagedRecorder),
+    Warm(WarmStagedRecorder),
+}
+
+impl TauriStagedCapture {
+    fn is_cold(&self) -> bool {
+        matches!(self, Self::Cold(_))
+    }
+}
+
+enum TauriCommittedCapture {
+    Cold {
+        recorder: Recorder,
+        runtime_errors: std::sync::mpsc::Receiver<RecorderError>,
+        archive_active: bool,
+    },
+    Warm {
+        capture: WarmActiveCapture,
+        runtime_errors: std::sync::mpsc::Receiver<RecorderError>,
+        archive_active: bool,
+    },
+}
+
+impl TauriStagedCapture {
+    fn commit(
+        self,
+        consumer: Arc<dyn LegacyAudioConsumer>,
+        level_handler: Arc<dyn Fn(f32) + Send + Sync>,
+        archive_path: Option<PathBuf>,
+        processing: openless_core::AudioProcessingConfig,
+    ) -> Result<TauriCommittedCapture, RecorderError> {
+        match self {
+            Self::Cold(staged) => {
+                let (recorder, runtime_errors, archive_active) =
+                    staged.commit(consumer, level_handler, archive_path)?;
+                Ok(TauriCommittedCapture::Cold {
+                    recorder,
+                    runtime_errors,
+                    archive_active,
+                })
+            }
+            Self::Warm(staged) => {
+                let fallback_device = staged.fallback_device_name();
+                let fallback_hub = staged.capture_hub();
+                let fallback_consumer = Arc::clone(&consumer);
+                let fallback_level_handler = Arc::clone(&level_handler);
+                let fallback_archive_path = archive_path.clone();
+                match staged.commit(consumer, level_handler, archive_path) {
+                    Ok((capture, runtime_errors, archive_active)) => {
+                        Ok(TauriCommittedCapture::Warm {
+                            capture,
+                            runtime_errors,
+                            archive_active,
+                        })
+                    }
+                    Err(error)
+                        if matches!(
+                            &error,
+                            RecorderError::EngineFailed(message)
+                                if message == "warm provisional capture was not armed"
+                        ) =>
+                    {
+                        fallback_hub.begin_cold_capture()?;
+                        fallback_hub.suspend_for_cold_capture();
+                        let cold = match Recorder::start_staged_with_processing(
+                            fallback_device,
+                            STAGED_CAPTURE_MAX_BYTES,
+                            processing,
+                        ) {
+                            Ok(cold) => cold,
+                            Err(error) => {
+                                fallback_hub.end_cold_capture();
+                                return Err(error);
+                            }
+                        };
+                        let (recorder, runtime_errors, archive_active) = match cold.commit(
+                            fallback_consumer,
+                            fallback_level_handler,
+                            fallback_archive_path,
+                        ) {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                fallback_hub.end_cold_capture();
+                                return Err(error);
+                            }
+                        };
+                        Ok(TauriCommittedCapture::Cold {
+                            recorder,
+                            runtime_errors,
+                            archive_active,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    fn discard(self) -> Result<(), RecorderError> {
+        match self {
+            Self::Cold(staged) => staged.discard(),
+            Self::Warm(staged) => staged.discard(),
+        }
+    }
+}
+
+struct TauriPendingAudioCapture {
+    app: AppHandleSlot,
+    backend: BackendSlot,
+    warm_hub: Arc<WarmCaptureHub>,
+    staged: Option<TauriStagedCapture>,
+}
+
+struct TauriActiveRecording {
+    recorder: Option<Recorder>,
+    warm_capture: Option<WarmActiveCapture>,
+    cold_capture_hub: Option<Arc<WarmCaptureHub>>,
+    resume_warm_hub: Option<Arc<WarmCaptureHub>>,
+    archive: Option<Arc<TauriRecordingArchive>>,
+    _mute: Option<crate::audio_mute::AudioMuteGuard>,
+}
+
+impl PendingAudioCapture for TauriPendingAudioCapture {
+    fn commit(
+        self: Box<Self>,
+        session_id: SessionId,
+        context: Arc<DictationContext>,
+        consumer: Arc<dyn CoreAudioConsumer>,
+        progress: Arc<dyn RecordingProgressSink>,
+    ) -> BoxFuture<'static, Result<Box<dyn ActiveRecording>, BackendError>> {
+        let TauriPendingAudioCapture {
+            app,
+            backend,
+            warm_hub,
+            staged,
+        } = *self;
+        let Some(staged) = staged else {
+            return Box::pin(async {
+                Err(BackendError::new(
+                    BackendErrorCode::InvalidState,
+                    "provisional Tauri recorder was already consumed",
+                ))
+            });
+        };
+        Box::pin(async move {
+            let permanent_archive = matches!(
+                context.output_target,
+                openless_core::DictationOutputTarget::QuickNote
+                    | openless_core::DictationOutputTarget::Undecided
+            );
+            let archive_path = context
+                .recording
+                .archive_enabled
+                .then(|| {
+                    if permanent_archive {
+                        crate::persistence::quick_note_recording_path_for_session(
+                            &session_id.to_string(),
+                        )
+                    } else {
+                        crate::persistence::recording_path_for_session(&session_id.to_string())
+                    }
+                })
+                .transpose();
+            let recording_plan = context.recording.clone();
+            let fault_progress = Arc::clone(&progress);
+            #[cfg(not(mobile))]
+            let monitor_app = app.lock().clone();
+            let warm_hub_for_join = Arc::clone(&warm_hub);
+            let joined = tauri::async_runtime::spawn_blocking(move || {
+                let archive_path = archive_path
+                    .map_err(|error| {
+                        log::warn!("[recordings] archive unavailable; capture continues: {error}")
+                    })
+                    .ok()
+                    .flatten();
+                let started_at = Instant::now();
+                let level_progress = Arc::clone(&progress);
+                let level_handler: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |level| {
+                    let _ = level_progress
+                        .publish_level(started_at.elapsed().as_millis() as u64, level);
+                });
+                let consumer: Arc<dyn LegacyAudioConsumer> =
+                    Arc::new(AudioConsumerBridge { inner: consumer });
+                let mute = recording_plan
+                    .mute_during_recording
+                    .then(crate::audio_mute::AudioMuteGuard::activate)
+                    .and_then(|result| {
+                        result
+                            .map_err(|error| {
+                                log::warn!(
+                                    "[audio-mute] failed to mute output; capture continues: {error}"
+                                )
+                            })
+                            .ok()
+                    });
+                let committed = {
+                    let commit = || {
+                        staged
+                            .commit(
+                                consumer,
+                                level_handler,
+                                archive_path.clone(),
+                                recording_plan.audio_processing,
+                            )
+                            .map_err(map_recorder_error)
+                    };
+                    #[cfg(not(mobile))]
+                    {
+                        if let Some(app) = monitor_app {
+                            let state = app.state::<crate::commands::MicrophoneMonitorState>();
+                            let _operation = state.operation.lock();
+                            if let Some(preview) = state.recorder.lock().take() {
+                                preview.stop();
+                            }
+                            warm_hub.end_preview();
+                            commit()
+                        } else {
+                            commit()
+                        }
+                    }
+                    #[cfg(mobile)]
+                    {
+                        commit()
+                    }
+                };
+                let committed = match committed {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        drop(mute);
+                        warm_hub.end_cold_capture();
+                        return Err(error);
+                    }
+                };
+                let (
+                    recorder,
+                    warm_capture,
+                    cold_capture_hub,
+                    runtime_errors,
+                    archive_active,
+                    resume_warm_hub,
+                ) = match committed {
+                    TauriCommittedCapture::Cold {
+                        recorder,
+                        runtime_errors,
+                        archive_active,
+                    } => (
+                        Some(recorder),
+                        None,
+                        Some(Arc::clone(&warm_hub)),
+                        Some(runtime_errors),
+                        archive_active,
+                        Some(Arc::clone(&warm_hub)),
+                    ),
+                    TauriCommittedCapture::Warm {
+                        capture,
+                        runtime_errors,
+                        archive_active,
+                    } => (
+                        None,
+                        Some(capture),
+                        None,
+                        Some(runtime_errors),
+                        archive_active,
+                        None,
+                    ),
+                };
+                if recording_plan.archive_required && !archive_active {
+                    let has_warm_capture = warm_capture.is_some();
+                    if let Some(recorder) = recorder {
+                        recorder.stop();
+                    }
+                    if let Some(capture) = warm_capture {
+                        capture.stop();
+                    }
+                    if let Some(cold_capture_hub) = cold_capture_hub.as_ref() {
+                        cold_capture_hub.end_cold_capture();
+                    }
+                    if !has_warm_capture {
+                        if let Some(warm_hub) = resume_warm_hub {
+                            warm_hub.resume_after_cold_capture();
+                        }
+                    }
+                    if let Some(path) = &archive_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(BackendError::new(
+                        BackendErrorCode::Persistence,
+                        "速记录音文件无法创建，已阻止开始录音以避免丢失内容",
+                    ));
+                }
+                if recording_plan.archive_enabled {
+                    if let Err(error) = crate::persistence::prune_recordings(
+                        recording_plan.retention_days,
+                        recording_plan.max_entries,
+                    ) {
+                        log::warn!("[recordings] prune after promoted capture failed: {error:#}");
+                    }
+                }
+                let recording = Box::new(TauriActiveRecording {
+                    recorder,
+                    warm_capture,
+                    cold_capture_hub,
+                    resume_warm_hub,
+                    archive: archive_path
+                        .map(|path| Arc::new(TauriRecordingArchive::new(path, archive_active))),
+                    _mute: mute,
+                }) as Box<dyn ActiveRecording>;
+                Ok((recording, runtime_errors))
+            });
+            let (recording, runtime_errors) = match joined.await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    warm_hub_for_join.end_cold_capture();
+                    return Err(BackendError::new(
+                        BackendErrorCode::Internal,
+                        format!("join promoted Tauri recorder task: {error}"),
+                    ));
+                }
+            };
+            if let Some(runtime_errors) = runtime_errors {
+                tauri::async_runtime::spawn(async move {
+                    let runtime_error =
+                        tauri::async_runtime::spawn_blocking(move || runtime_errors.recv()).await;
+                    let Ok(Ok(runtime_error)) = runtime_error else {
+                        return;
+                    };
+                    let error = map_recorder_error(runtime_error);
+                    let _ =
+                        fault_progress.publish(openless_core::RecordingEvent::Fatal(error.clone()));
+                    let backend = backend.lock().as_ref().and_then(std::sync::Weak::upgrade);
+                    if let Some(backend) = backend {
+                        if let Err(report_error) =
+                            backend.report_recording_fault(session_id, error).await
+                        {
+                            if report_error.code != BackendErrorCode::InvalidState {
+                                log::warn!(
+                                    "[recorder] report promoted runtime fault failed: {report_error}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            let _ = app;
+            Ok(recording)
+        })
+    }
+
+    fn discard(self: Box<Self>) -> BoxFuture<'static, Result<(), BackendError>> {
+        let TauriPendingAudioCapture {
+            warm_hub, staged, ..
+        } = *self;
+        Box::pin(async move {
+            let Some(staged) = staged else {
+                return Ok(());
+            };
+            let cold_capture = staged.is_cold();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                staged.discard().map_err(map_recorder_error)
+            })
+            .await
+            .map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Internal,
+                    format!("join provisional Tauri recorder discard task: {error}"),
+                )
+            })?;
+            if cold_capture {
+                warm_hub.end_cold_capture();
+            }
+            result
+        })
+    }
+}
+
+struct TauriRecordingArchive {
+    path: Arc<Mutex<PathBuf>>,
+    available: Arc<AtomicBool>,
+}
+
+impl TauriRecordingArchive {
+    fn new(path: PathBuf, available: bool) -> Self {
+        Self {
+            path: Arc::new(Mutex::new(path)),
+            available: Arc::new(AtomicBool::new(available)),
+        }
+    }
+}
+
+impl RecordingArchive for TauriRecordingArchive {
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
+
+    fn read_pcm(&self) -> BoxFuture<'static, Result<Vec<u8>, BackendError>> {
+        let path = self.path.lock().clone();
+        Box::pin(async move {
+            let wav = tokio::fs::read(&path).await.map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Persistence,
+                    format!("read dictation recording archive: {error}"),
+                )
+            })?;
+            if wav.len() <= 44
+                || &wav[..4] != b"RIFF"
+                || &wav[8..12] != b"WAVE"
+                || !(wav.len() - 44).is_multiple_of(2)
+            {
+                return Err(BackendError::new(
+                    BackendErrorCode::Persistence,
+                    "dictation recording archive is not canonical PCM WAV",
+                ));
+            }
+            Ok(wav[44..].to_vec())
+        })
+    }
+
+    fn discard(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let path = self.path.lock().clone();
+        let available = Arc::clone(&self.available);
+        Box::pin(async move {
+            if !available.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    available.store(false, Ordering::Release);
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    available.store(false, Ordering::Release);
+                    Ok(())
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[core-adapter] 清理成功口述的归档录音失败 {}: {error}",
+                        path.display()
+                    );
+                    Err(BackendError::new(
+                        BackendErrorCode::Persistence,
+                        format!("discard dictation recording archive: {error}"),
+                    ))
+                }
+            }
+        })
+    }
+
+    fn promote_to_quick_note(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let path = Arc::clone(&self.path);
+        Box::pin(async move {
+            let current = path.lock().clone();
+            let Some(file_name) = current.file_name().map(|name| name.to_owned()) else {
+                return Err(BackendError::new(
+                    BackendErrorCode::Persistence,
+                    "quick-note archive has no file name",
+                ));
+            };
+            let target = crate::persistence::quick_note_recordings_root()
+                .map_err(|error| {
+                    BackendError::new(BackendErrorCode::Persistence, error.to_string())
+                })?
+                .join(file_name);
+            if current == target {
+                return Ok(());
+            }
+            tokio::fs::rename(&current, &target)
+                .await
+                .map_err(|error| {
+                    BackendError::new(
+                        BackendErrorCode::Persistence,
+                        format!("promote quick-note recording archive: {error}"),
+                    )
+                })?;
+            *path.lock() = target;
+            Ok(())
+        })
+    }
+
+    fn demote_to_ordinary_recording(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let path = Arc::clone(&self.path);
+        Box::pin(async move {
+            let current = path.lock().clone();
+            let Some(file_name) = current.file_name().map(|name| name.to_owned()) else {
+                return Err(BackendError::new(
+                    BackendErrorCode::Persistence,
+                    "recording archive has no file name",
+                ));
+            };
+            let target = crate::persistence::recordings_root()
+                .map_err(|error| {
+                    BackendError::new(BackendErrorCode::Persistence, error.to_string())
+                })?
+                .join(file_name);
+            if current == target {
+                return Ok(());
+            }
+            tokio::fs::rename(&current, &target)
+                .await
+                .map_err(|error| {
+                    BackendError::new(
+                        BackendErrorCode::Persistence,
+                        format!("move recording archive to ordinary storage: {error}"),
+                    )
+                })?;
+            *path.lock() = target;
+            Ok(())
+        })
+    }
+}
+
+impl ActiveRecording for TauriActiveRecording {
+    fn archive(&self) -> Option<Arc<dyn RecordingArchive>> {
+        self.archive
+            .as_ref()
+            .map(|archive| archive.clone() as Arc<dyn RecordingArchive>)
+    }
+
+    fn stop(mut self: Box<Self>) -> BoxFuture<'static, Result<(), BackendError>> {
+        Box::pin(async move {
+            let recorder = self.recorder.take();
+            let warm_capture = self.warm_capture.take();
+            let cold_capture_hub = self.cold_capture_hub.take();
+            let resume_warm_hub = self.resume_warm_hub.take();
+            if recorder.is_none() && warm_capture.is_none() {
+                return Err(BackendError::new(
+                    BackendErrorCode::InvalidState,
+                    "Tauri recorder was already stopped",
+                ));
+            }
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(recorder) = recorder {
+                    recorder.stop();
+                }
+                let has_warm_capture = warm_capture.is_some();
+                if let Some(warm_capture) = warm_capture {
+                    warm_capture.stop();
+                }
+                if let Some(cold_capture_hub) = cold_capture_hub {
+                    cold_capture_hub.end_cold_capture();
+                }
+                if !has_warm_capture {
+                    if let Some(warm_hub) = resume_warm_hub {
+                        warm_hub.resume_after_cold_capture();
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Internal,
+                    format!("join Tauri recorder stop task: {error}"),
+                )
+            })?
+        })
+    }
+}
+
+/// Archiving and system output muting keep 1.x best-effort semantics: an unwritable directory,
+/// no default speaker, or a failed macOS volume script does not mean the input microphone is
+/// unusable. Warn on each failure and disable only the failed auxiliary item, letting the later
+/// `Recorder::start` report the real capture error; a successful mute guard stays owned by the
+/// recording resources.
+fn prepare_recording_options<M>(
+    archive_path: Result<Option<PathBuf>, impl std::fmt::Display>,
+    mute_enabled: bool,
+    activate_mute: impl FnOnce() -> Result<M, String>,
+) -> (Option<PathBuf>, Option<M>) {
+    let archive_path = archive_path
+        .map_err(|error| log::warn!("[recordings] archive unavailable; capture continues: {error}"))
+        .ok()
+        .flatten();
+    let mute = mute_enabled.then(activate_mute).and_then(|result| {
+        result
+            .map_err(|error| {
+                log::warn!("[audio-mute] failed to mute output; capture continues: {error}")
+            })
+            .ok()
+    });
+    (archive_path, mute)
+}
+
+impl TauriAudioRecorder {
+    fn arm_capture_after_preview(
+        &self,
+        request: CaptureStartRequest,
+    ) -> Result<Box<dyn PendingAudioCapture>, BackendError> {
+        self.warm_hub.end_preview();
+        if request.low_latency {
+            if let Ok(staged) = self.warm_hub.arm(
+                request.press_id,
+                request.microphone_device_name.clone(),
+                request.audio_processing,
+            ) {
+                return Ok(Box::new(TauriPendingAudioCapture {
+                    app: Arc::clone(&self.app),
+                    backend: Arc::clone(&self.backend),
+                    warm_hub: Arc::clone(&self.warm_hub),
+                    staged: Some(TauriStagedCapture::Warm(staged)),
+                }));
+            }
+            log::warn!("[recorder] warm capture unavailable; falling back to press-time staging");
+        }
+        if !request.low_latency {
+            self.warm_hub.stop();
+        }
+        let max_buffer_bytes = (request.pre_roll_ms as usize)
+            .saturating_mul(32)
+            .clamp(2, 16_000);
+        self.warm_hub
+            .begin_cold_capture()
+            .map_err(map_recorder_error)?;
+        let staged = match Recorder::start_staged_with_processing(
+            request.microphone_device_name,
+            max_buffer_bytes,
+            request.audio_processing,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.warm_hub.end_cold_capture();
+                return Err(map_recorder_error(error));
+            }
+        };
+        Ok(Box::new(TauriPendingAudioCapture {
+            app: Arc::clone(&self.app),
+            backend: Arc::clone(&self.backend),
+            warm_hub: Arc::clone(&self.warm_hub),
+            staged: Some(TauriStagedCapture::Cold(staged)),
+        }))
+    }
+}
+
+impl AudioRecorder for TauriAudioRecorder {
+    fn arm_capture(
+        &self,
+        request: CaptureStartRequest,
+    ) -> Result<Box<dyn PendingAudioCapture>, BackendError> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = request;
+            return Err(BackendError::new(
+                BackendErrorCode::Unsupported,
+                "provisional native capture is only enabled for Windows desktop",
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(not(mobile))]
+            if let Some(app) = self.app.lock().clone() {
+                let state = app.state::<crate::commands::MicrophoneMonitorState>();
+                let _operation = state.operation.lock();
+                let preview = state.recorder.lock().take();
+                if let Some(preview) = preview {
+                    preview.stop();
+                }
+                return self.arm_capture_after_preview(request);
+            }
+            self.arm_capture_after_preview(request)
+        }
+    }
+
+    fn start(
+        &self,
+        session_id: SessionId,
+        context: Arc<DictationContext>,
+        consumer: Arc<dyn CoreAudioConsumer>,
+        progress: Arc<dyn RecordingProgressSink>,
+    ) -> BoxFuture<'static, Result<Box<dyn ActiveRecording>, BackendError>> {
+        let app = Arc::clone(&self.app);
+        let backend = Arc::clone(&self.backend);
+        let warm_hub = Arc::clone(&self.warm_hub);
+        Box::pin(async move {
+            warm_hub.begin_cold_capture().map_err(map_recorder_error)?;
+            #[cfg(not(mobile))]
+            {
+                if let Some(app) = app.lock().clone() {
+                    let state = app.state::<crate::commands::MicrophoneMonitorState>();
+                    let _operation = state.operation.lock();
+                    let preview = state.recorder.lock().take();
+                    if let Some(preview) = preview {
+                        preview.stop();
+                    }
+                }
+                warm_hub.end_preview();
+            }
+            warm_hub.suspend_for_cold_capture();
+            let resume_warm_hub = Arc::clone(&warm_hub);
+            let permanent_archive = matches!(
+                context.output_target,
+                openless_core::DictationOutputTarget::QuickNote
+                    | openless_core::DictationOutputTarget::Undecided
+            );
+            // Undecided Android captures use the permanent quick-note spool
+            // until the terminal tap/gesture classifies the session.
+            let archive_path = context
+                .recording
+                .archive_enabled
+                .then(|| {
+                    if permanent_archive {
+                        crate::persistence::quick_note_recording_path_for_session(
+                            &session_id.to_string(),
+                        )
+                    } else {
+                        crate::persistence::recording_path_for_session(&session_id.to_string())
+                    }
+                })
+                .transpose();
+            let microphone = context.recording.microphone_device_name.clone();
+            let recording_plan = context.recording.clone();
+            let prune_recordings_before_capture = recording_plan.archive_enabled
+                && (!recording_plan.archive_required
+                    || context.output_target == openless_core::DictationOutputTarget::Undecided);
+            let fault_progress = Arc::clone(&progress);
+            let worker_resume_warm_hub = Arc::clone(&resume_warm_hub);
+            let joined = tauri::async_runtime::spawn_blocking(move || {
+                if prune_recordings_before_capture {
+                    if let Err(error) = crate::persistence::prune_recordings(
+                        recording_plan.retention_days,
+                        recording_plan.max_entries,
+                    ) {
+                        log::warn!("[recordings] prune before capture failed: {error:#}");
+                    }
+                }
+                let (archive_path, mute) = prepare_recording_options(
+                    archive_path,
+                    recording_plan.mute_during_recording,
+                    crate::audio_mute::AudioMuteGuard::activate,
+                );
+                let started_at = Instant::now();
+                let level_progress = Arc::clone(&progress);
+                let level_handler: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |level| {
+                    let _ = level_progress
+                        .publish_level(started_at.elapsed().as_millis() as u64, level);
+                });
+                let consumer: Arc<dyn LegacyAudioConsumer> =
+                    Arc::new(AudioConsumerBridge { inner: consumer });
+                let recorder_archive_path = archive_path.clone();
+                let start_result = Recorder::start_with_processing(
+                    microphone,
+                    consumer,
+                    level_handler,
+                    recorder_archive_path,
+                    recording_plan.audio_processing,
+                );
+                let (recorder, runtime_errors, archive_active) = match start_result {
+                    Ok(started) => started,
+                    Err(error) => {
+                        // Recorder::start may create the WAV before the native
+                        // stream fails. No archive handle is returned on this
+                        // path, so remove that partial file here.
+                        if let Some(path) = &archive_path {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        worker_resume_warm_hub.end_cold_capture();
+                        worker_resume_warm_hub.resume_after_cold_capture();
+                        return Err(map_recorder_error(error));
+                    }
+                };
+                if recording_plan.archive_required && !archive_active {
+                    recorder.stop();
+                    if let Some(path) = &archive_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    worker_resume_warm_hub.end_cold_capture();
+                    worker_resume_warm_hub.resume_after_cold_capture();
+                    return Err(BackendError::new(
+                        BackendErrorCode::Persistence,
+                        "速记录音文件无法创建，已阻止开始录音以避免丢失内容",
+                    ));
+                }
+                let recording = Box::new(TauriActiveRecording {
+                    recorder: Some(recorder),
+                    warm_capture: None,
+                    cold_capture_hub: Some(Arc::clone(&warm_hub)),
+                    resume_warm_hub: Some(worker_resume_warm_hub),
+                    archive: archive_path
+                        .map(|path| Arc::new(TauriRecordingArchive::new(path, archive_active))),
+                    _mute: mute,
+                }) as Box<dyn ActiveRecording>;
+                Ok((recording, runtime_errors))
+            })
+            .await;
+            let inner = match joined {
+                Ok(inner) => inner,
+                Err(error) => {
+                    resume_warm_hub.end_cold_capture();
+                    resume_warm_hub.resume_after_cold_capture();
+                    return Err(BackendError::new(
+                        BackendErrorCode::Internal,
+                        format!("join Tauri recorder start task: {error}"),
+                    ));
+                }
+            }?;
+            let (recording, runtime_errors) = inner;
+            tauri::async_runtime::spawn(async move {
+                let runtime_error =
+                    tauri::async_runtime::spawn_blocking(move || runtime_errors.recv()).await;
+                let Ok(Ok(runtime_error)) = runtime_error else {
+                    return;
+                };
+                let error = map_recorder_error(runtime_error);
+                let _ = fault_progress.publish(openless_core::RecordingEvent::Fatal(error.clone()));
+                let backend = backend.lock().as_ref().and_then(std::sync::Weak::upgrade);
+                if let Some(backend) = backend {
+                    if let Err(report_error) =
+                        backend.report_recording_fault(session_id, error).await
+                    {
+                        if report_error.code != BackendErrorCode::InvalidState {
+                            log::warn!("[recorder] report runtime fault failed: {report_error}");
+                        }
+                    }
+                }
+            });
+            Ok(recording)
+        })
+    }
+}
+
+fn map_recorder_error(error: RecorderError) -> BackendError {
+    let code = match error {
+        RecorderError::PermissionDenied => BackendErrorCode::PermissionDenied,
+        RecorderError::NoInputDevice | RecorderError::EngineFailed(_) => BackendErrorCode::Platform,
+    };
+    BackendError::new(code, error.user_message())
+}
+
+#[derive(Clone)]
+pub(crate) struct TauriTextInserter {
+    app: AppHandleSlot,
+    backend: BackendSlot,
+    insertion_target: Option<crate::selection::SelectionInsertionTarget>,
+    #[cfg(target_os = "windows")]
+    ime_target: Option<crate::windows_ime_ipc::ImeSubmitTarget>,
+    #[cfg(target_os = "windows")]
+    windows_ime: Arc<crate::windows_ime_session::WindowsImeSessionController>,
+}
+
+#[derive(Default)]
+struct TauriEditObservationAdapter {
+    watcher: Mutex<Option<crate::host_document::EditWatcher>>,
+}
+
+impl EditObservationAdapter for TauriEditObservationAdapter {
+    fn arm(
+        &self,
+        typed_text: String,
+        sink: Arc<dyn EditObservationSink>,
+    ) -> Result<(), BackendError> {
+        *self.watcher.lock() = crate::host_document::watch_for_edits(
+            typed_text,
+            sink.observation_duration(),
+            move |edit| sink.publish(edit),
+        );
+        Ok(())
+    }
+
+    fn disarm(&self) {
+        *self.watcher.lock() = None;
+    }
+}
+
+impl TauriTextInserter {
+    fn new(app: AppHandleSlot, backend: BackendSlot) -> Self {
+        Self {
+            app,
+            backend,
+            insertion_target: None,
+            #[cfg(target_os = "windows")]
+            ime_target: None,
+            #[cfg(target_os = "windows")]
+            windows_ime: Arc::new(crate::windows_ime_session::WindowsImeSessionController::new()),
+        }
+    }
+}
+
+/// Switch ABC only for actual streaming input. A TIS failure is a platform capability
+/// downgrade and must not block a one-shot paste that doesn't need TIS; Core reads the
+/// supports_streaming receipt and keeps exclusive control of the reconciliation policy.
+#[cfg(any(target_os = "macos", test))]
+async fn prepare_streaming_input_source<T: Default, E: std::fmt::Display, F>(
+    streaming: bool,
+    switch: impl FnOnce() -> F,
+) -> (T, bool)
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if !streaming {
+        return (T::default(), false);
+    }
+    match switch().await {
+        Ok(previous) => (previous, true),
+        Err(error) => {
+            log::warn!(
+                "[core-adapter] ASCII input source unavailable; use one-shot insertion: {error}"
+            );
+            (T::default(), false)
+        }
+    }
+}
+
+/// Worker creation follows an already completed TIS switch. Roll back that
+/// switch on startup failure, retaining the original error if rollback fails.
+#[cfg(target_os = "macos")]
+async fn start_worker_restoring_on_error<P, W, F>(
+    previous: P,
+    start: impl FnOnce() -> Result<W, BackendError>,
+    restore: impl FnOnce(P) -> F,
+) -> Result<(P, W), BackendError>
+where
+    F: std::future::Future<Output = Result<(), BackendError>>,
+{
+    match start() {
+        Ok(worker) => Ok((previous, worker)),
+        Err(error) => {
+            if let Err(restore_error) = restore(previous).await {
+                log::warn!("[core-adapter] restore input source after worker startup failed: {restore_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacInsertionCompletion {
+    Finished(InsertOutcome),
+    Cancelled,
+}
+
+/// TIS restoration belongs to the terminal effect, never to an individual
+/// caller's future. Repeated finish/cancel callers join the same result.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct MacInsertionTerminal {
+    started: AtomicBool,
+    result: std::sync::OnceLock<Result<MacInsertionCompletion, BackendError>>,
+    ready: tokio::sync::Notify,
+}
+
+#[cfg(target_os = "macos")]
+impl MacInsertionTerminal {
+    fn settle(&self, result: Result<MacInsertionCompletion, BackendError>) {
+        if self.result.set(result).is_ok() {
+            self.ready.notify_waiters();
+        }
+    }
+
+    async fn join_or_spawn<F>(
+        self: &Arc<Self>,
+        effect: impl FnOnce() -> F + Send + 'static,
+        spawn: impl FnOnce(BoxFuture<'static, ()>),
+    ) -> Result<MacInsertionCompletion, BackendError>
+    where
+        F: std::future::Future<Output = Result<MacInsertionCompletion, BackendError>>
+            + Send
+            + 'static,
+    {
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let guard = MacInsertionTerminalGuard(Arc::clone(self));
+            spawn(Box::pin(async move {
+                guard.settle(effect().await);
+            }));
+        }
+        loop {
+            let notified = self.ready.notified();
+            if let Some(result) = self.result.get() {
+                return result.clone();
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacInsertionTerminalGuard(Arc<MacInsertionTerminal>);
+
+#[cfg(target_os = "macos")]
+impl MacInsertionTerminalGuard {
+    fn settle(&self, result: Result<MacInsertionCompletion, BackendError>) {
+        self.0.settle(result);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacInsertionTerminalGuard {
+    fn drop(&mut self) {
+        self.0.settle(Err(BackendError::new(
+            BackendErrorCode::Internal,
+            "macOS insertion finalization did not complete",
+        )));
+    }
+}
+
+/// Preserve the existing written-text outcome on TIS restoration failure, but
+/// always restore after a failed delivery barrier as well. A barrier error must
+/// not cause a second insertion of text that may already have been posted.
+#[cfg(target_os = "macos")]
+async fn finish_mac_insertion_after_barrier<B, E, R>(
+    barrier: B,
+    effect: impl FnOnce() -> E,
+    restore: impl FnOnce() -> R,
+) -> Result<MacInsertionCompletion, BackendError>
+where
+    B: std::future::Future<Output = Result<(), BackendError>>,
+    E: std::future::Future<Output = Result<MacInsertionCompletion, BackendError>>,
+    R: std::future::Future<Output = Result<(), BackendError>>,
+{
+    let result = match barrier.await {
+        Ok(()) => effect().await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = restore().await {
+        log::warn!("[core-adapter] restore input state after insertion failed: {error}");
+        if matches!(result, Ok(MacInsertionCompletion::Cancelled)) {
+            return Err(error);
+        }
+    }
+    result
+}
+
+impl CoreTextInserter for TauriTextInserter {
+    fn capture_target(&self) -> Option<CapturedTextTarget> {
+        let insertion_target = crate::selection::capture_selection_insertion_target();
+        #[cfg(target_os = "windows")]
+        let ime_target = crate::windows_ime_target::capture_ime_submit_target();
+        Some(CapturedTextTarget {
+            inserter: Arc::new(Self {
+                insertion_target: Some(insertion_target.clone()),
+                #[cfg(target_os = "windows")]
+                ime_target,
+                ..self.clone()
+            }),
+            host_context: Arc::new(TauriHostContextAdapter::for_target(insertion_target)),
+        })
+    }
+
+    fn begin(
+        &self,
+        session_id: SessionId,
+        context: Arc<DictationContext>,
+    ) -> BoxFuture<'static, Result<Arc<dyn TextInsertionSession>, BackendError>> {
+        let app = Arc::clone(&self.app);
+        let backend = Arc::clone(&self.backend);
+        let insertion_target = self.insertion_target.clone();
+        #[cfg(target_os = "windows")]
+        let ime_target = self
+            .ime_target
+            .or_else(crate::windows_ime_target::capture_ime_submit_target);
+        #[cfg(target_os = "windows")]
+        let windows_ime = Arc::clone(&self.windows_ime);
+        Box::pin(async move {
+            // Retain the target captured before context/credential awaits in
+            // the insertion resource. Every later write must reactivate it; a
+            // failed restore becomes an explicit error instead of typing into
+            // whichever application happens to be focused at the end.
+            let insertion_target = insertion_target
+                .unwrap_or_else(crate::selection::capture_selection_insertion_target);
+            #[cfg(target_os = "macos")]
+            let (app_handle, mut previous_input_source, streaming_ready) = {
+                let app_handle = app.lock().clone().ok_or_else(|| {
+                    BackendError::new(
+                        BackendErrorCode::InvalidState,
+                        "Tauri AppHandle is not bound yet",
+                    )
+                })?;
+                let (previous, streaming_ready) = prepare_streaming_input_source(
+                    context.uses_llm_polisher()
+                        && openless_core::streaming_insert::streaming_insert_eligible(
+                        context.insertion.streaming,
+                        context.polish.translation_active,
+                        context.polish.chinese_script_preference
+                            == openless_core::shared_types::ChineseScriptPreference::Traditional,
+                        false,
+                    ),
+                    || crate::unicode_keystroke::switch_to_ascii(&app_handle),
+                )
+                .await;
+                (app_handle, previous, streaming_ready)
+            };
+            #[cfg(target_os = "macos")]
+            let cancel_requested = Arc::new(AtomicBool::new(false));
+            #[cfg(target_os = "macos")]
+            let streaming_worker = if streaming_ready {
+                let (previous, worker) = start_worker_restoring_on_error(
+                    previous_input_source,
+                    || {
+                        crate::macos_streaming_input::MacStreamingInput::spawn(
+                            insertion_target.clone(),
+                            context.insertion.macos_newline_mode,
+                            Arc::clone(&cancel_requested),
+                        )
+                    },
+                    |previous| {
+                        let app_handle = &app_handle;
+                        async move {
+                            crate::unicode_keystroke::restore_input_source(app_handle, previous)
+                                .await
+                                .map_err(|error| {
+                                    BackendError::new(BackendErrorCode::Platform, error.to_string())
+                                })
+                        }
+                    },
+                )
+                .await?;
+                previous_input_source = previous;
+                Some(worker)
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
+            let session = Arc::new(TauriTextInsertionSession {
+                session_id,
+                backend,
+                context,
+                insertion_target,
+                finished: Arc::new(AtomicBool::new(false)),
+                #[cfg(target_os = "windows")]
+                windows_ime,
+                #[cfg(target_os = "windows")]
+                composition: Arc::new(WindowsComposition::new(ime_target)),
+                #[cfg(target_os = "macos")]
+                app: app_handle,
+                #[cfg(target_os = "macos")]
+                previous_input_source: Arc::new(Mutex::new(previous_input_source)),
+                #[cfg(target_os = "macos")]
+                streaming_ready,
+                #[cfg(target_os = "macos")]
+                streaming_worker,
+                #[cfg(target_os = "macos")]
+                cancel_requested,
+                #[cfg(target_os = "macos")]
+                terminal: Arc::new(MacInsertionTerminal::default()),
+            });
+            #[cfg(target_os = "windows")]
+            if session.context.insertion.composition_input {
+                log::info!(
+                    "[core-adapter] TSF composition enabled mode={:?} target={:?} stable_transcription={}",
+                    session.context.insertion.windows_insertion_mode,
+                    session.composition_target(),
+                    session.context.recording.transcribe_after_stop,
+                );
+                // Re-activate the captured control immediately before the posted native prime. The
+                // DLL also validates the captured focus handle at dispatch time, so a focus change
+                // during the IPC round-trip cannot prime a different document.
+                if let Err(error) = session.restore_insertion_target() {
+                    log::warn!("[core-adapter] could not reactivate TSF composition target: {error}");
+                } else if let Err(error) = session.update_composition_text(String::new()).await {
+                    log::warn!("[core-adapter] could not prime TSF composition context: {error}");
+                } else {
+                    log::info!("[core-adapter] TSF composition context primed");
+                }
+            } else {
+                log::info!(
+                    "[core-adapter] TSF composition disabled mode={:?} stable_transcription={}",
+                    session.context.insertion.windows_insertion_mode,
+                    session.context.recording.transcribe_after_stop,
+                );
+            }
+            Ok(session as Arc<dyn TextInsertionSession>)
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TauriTextInsertionSession {
+    session_id: SessionId,
+    backend: BackendSlot,
+    context: Arc<DictationContext>,
+    insertion_target: crate::selection::SelectionInsertionTarget,
+    finished: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    windows_ime: Arc<crate::windows_ime_session::WindowsImeSessionController>,
+    #[cfg(target_os = "windows")]
+    composition: Arc<WindowsComposition>,
+    #[cfg(target_os = "macos")]
+    app: AppHandle,
+    #[cfg(target_os = "macos")]
+    previous_input_source: Arc<Mutex<Option<crate::unicode_keystroke::PreviousInputSource>>>,
+    #[cfg(target_os = "macos")]
+    streaming_ready: bool,
+    #[cfg(target_os = "macos")]
+    streaming_worker: Option<crate::macos_streaming_input::MacStreamingInput>,
+    #[cfg(target_os = "macos")]
+    cancel_requested: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    terminal: Arc<MacInsertionTerminal>,
+}
+
+/// Composition ownership is stable for one insertion session while submit tokens change per request.
+/// Seed the sequence from a fresh UUID so a restart cannot reliably reuse an owner that a host still
+/// associates with an abandoned native composition.
+#[cfg(target_os = "windows")]
+static NEXT_COMPOSITION_OWNER: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+static COMPOSITION_OWNER_START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn composition_process_instance_id() -> u32 {
+    *COMPOSITION_OWNER_START.get_or_init(|| (uuid::Uuid::new_v4().as_u128() as u32).max(1))
+}
+
+#[cfg(target_os = "windows")]
+fn next_composition_owner() -> u32 {
+    let start = composition_process_instance_id();
+    let sequence = NEXT_COMPOSITION_OWNER.fetch_add(1, Ordering::Relaxed);
+    start.wrapping_add(sequence).max(1)
+}
+
+/// Live composition state of one Windows TSF dictation.
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsComposition {
+    /// Stable owner for the composition across per-request IPC tokens.
+    owner: u32,
+    /// An update was sent, so the host may hold a composition or leftover DLL state. The
+    /// dictation must then end with a Finish, even if that update failed, so the next
+    /// dictation never inherits it.
+    attempted: AtomicBool,
+    /// At least one update was accepted and completed by the native host.
+    succeeded: AtomicBool,
+    /// The host refused or lost an update; the composition can no longer be trusted.
+    broken: AtomicBool,
+    /// Another insertion owns the native composition. This session never acquired native
+    /// ownership and must not attempt cleanup or use non-TSF fallback beside it.
+    conflicted: AtomicBool,
+    /// A plain TSF commit discovered native composition state that must be canceled before this
+    /// insertion can be released. Unlike `attempted`, this does not claim the current owner.
+    cleanup_required: AtomicBool,
+    /// Target captured before insertion begins. Every later call goes to the same thread, so the
+    /// composition can never leak into whatever window is focused at finish time.
+    target: std::sync::Mutex<Option<crate::windows_ime_ipc::ImeSubmitTarget>>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsComposition {
+    fn new(target: Option<crate::windows_ime_ipc::ImeSubmitTarget>) -> Self {
+        Self {
+            owner: next_composition_owner(),
+            target: std::sync::Mutex::new(target),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+enum WindowsCompositionSubmitResult {
+    Status(crate::types::InsertStatus),
+    NotDispatched,
+    DefiniteFailure(BackendError),
+    CompositionConflict(BackendError),
+    CompositionRecoveryRequired(BackendError),
+}
+
+impl TauriTextInsertionSession {
+    #[cfg(target_os = "windows")]
+    fn composition_in_use(&self) -> bool {
+        self.composition.attempted.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn composition_in_use(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    fn composition_conflicted(&self) -> bool {
+        self.composition.conflicted.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn composition_conflicted(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    fn composition_cleanup_required(&self) -> bool {
+        self.composition.cleanup_required.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn composition_cleanup_required(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    fn composition_conflict_error() -> BackendError {
+        BackendError::new(
+            BackendErrorCode::Platform,
+            "another dictation owns a live TSF composition",
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn composition_target(&self) -> Option<crate::windows_ime_ipc::ImeSubmitTarget> {
+        *self
+            .composition
+            .target
+            .lock()
+            .expect("composition target lock poisoned")
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn submit_composition_outcome(
+        &self,
+        op: crate::windows_ime_protocol::ImeSubmitOp,
+        text: String,
+        allow_same_process_fallback: bool,
+    ) -> Result<WindowsCompositionSubmitResult, BackendError> {
+        let request = crate::windows_ime_ipc::ImeSubmitRequest {
+            session_id: self.session_id.to_string(),
+            text,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            target: self.composition_target(),
+            op,
+            composition_owner: self.composition.owner,
+            composition_process_id: composition_process_instance_id(),
+            allow_same_process_fallback,
+        };
+        match self.windows_ime.submit(request).await {
+            Ok(status) => Ok(WindowsCompositionSubmitResult::Status(status)),
+            Err(error) if error.is_outcome_unknown() => Err(BackendError::new(
+                BackendErrorCode::OutcomeUnknown,
+                error.to_string(),
+            )),
+            Err(error) if error.is_not_dispatched() => {
+                Ok(WindowsCompositionSubmitResult::NotDispatched)
+            }
+            Err(error) if error.is_composition_conflict() => {
+                Ok(WindowsCompositionSubmitResult::CompositionConflict(
+                    BackendError::new(BackendErrorCode::Platform, error.to_string()),
+                ))
+            }
+            Err(error) if error.is_composition_recovery_required() => {
+                Ok(WindowsCompositionSubmitResult::CompositionRecoveryRequired(
+                    BackendError::new(BackendErrorCode::Platform, error.to_string()),
+                ))
+            }
+            Err(error) if error.is_target_unavailable() => {
+                Ok(WindowsCompositionSubmitResult::DefiniteFailure(
+                    BackendError::new(BackendErrorCode::Platform, error.to_string())
+                        .target_unavailable(),
+                ))
+            }
+            Err(error) => {
+                Ok(WindowsCompositionSubmitResult::DefiniteFailure(
+                    BackendError::new(BackendErrorCode::Platform, error.to_string()),
+                ))
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn submit_composition(
+        &self,
+        op: crate::windows_ime_protocol::ImeSubmitOp,
+        text: String,
+    ) -> Result<crate::types::InsertStatus, BackendError> {
+        match self
+            .submit_composition_outcome(op, text, false)
+            .await?
+        {
+            WindowsCompositionSubmitResult::Status(status) => Ok(status),
+            WindowsCompositionSubmitResult::NotDispatched => Ok(crate::types::InsertStatus::Failed),
+            WindowsCompositionSubmitResult::CompositionConflict(error) => Err(error),
+            WindowsCompositionSubmitResult::CompositionRecoveryRequired(error) => Err(error),
+            WindowsCompositionSubmitResult::DefiniteFailure(_) => {
+                Ok(crate::types::InsertStatus::Failed)
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn clear_composition(
+        &self,
+        allow_same_process_fallback: bool,
+    ) -> Result<(), BackendError> {
+        let mut last_error = BackendError::new(
+            BackendErrorCode::Platform,
+            "the host refused to clear the live composition",
+        );
+        for attempt in 0..3 {
+            match self
+                .submit_composition_outcome(
+                    crate::windows_ime_protocol::ImeSubmitOp::Cancel,
+                    String::new(),
+                    allow_same_process_fallback,
+                )
+                .await
+            {
+                Ok(WindowsCompositionSubmitResult::Status(
+                    crate::types::InsertStatus::Inserted,
+                ))
+                | Ok(WindowsCompositionSubmitResult::NotDispatched) => {
+                    self.composition.attempted.store(false, Ordering::Release);
+                    self.composition.succeeded.store(false, Ordering::Release);
+                    self.composition.broken.store(false, Ordering::Release);
+                    self.composition.conflicted.store(false, Ordering::Release);
+                    self.composition.cleanup_required.store(false, Ordering::Release);
+                    return Ok(());
+                }
+                Ok(WindowsCompositionSubmitResult::Status(_)) => {
+                    last_error = BackendError::new(
+                        BackendErrorCode::Platform,
+                        "the host refused to clear the live composition",
+                    );
+                }
+                Ok(WindowsCompositionSubmitResult::CompositionConflict(error))
+                | Ok(WindowsCompositionSubmitResult::CompositionRecoveryRequired(error))
+                | Ok(WindowsCompositionSubmitResult::DefiniteFailure(error)) => {
+                    last_error = error;
+                }
+                Err(error) => last_error = error,
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Shows `text` as the live composition, replacing the previous update.
+    #[cfg(target_os = "windows")]
+    async fn update_composition_text(&self, text: String) -> Result<(), BackendError> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(BackendError::new(
+                BackendErrorCode::Cancelled,
+                "text insertion session is closed",
+            ));
+        }
+        if self.composition.broken.load(Ordering::Acquire) {
+            return Err(BackendError::new(
+                BackendErrorCode::Platform,
+                "the previous TSF composition submit failed",
+            ));
+        }
+        if self.composition_conflicted() {
+            return Err(Self::composition_conflict_error());
+        }
+        if self.context.insertion.windows_insertion_mode
+            != openless_core::shared_types::WindowsInsertionMode::Tsf
+        {
+            return Err(BackendError::new(
+                BackendErrorCode::Unsupported,
+                "composition display requires TSF insertion",
+            ));
+        }
+
+        // A restarted OpenLess process may need one native cancel before the new process can open
+        // its composition. Keep this retry iterative: recursive async self-awaits do not compile
+        // because they create an infinitely sized future.
+        let mut recovered = false;
+        loop {
+            if self.finished.load(Ordering::Acquire) {
+                return Err(BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "text insertion session is closed",
+                ));
+            }
+            let had_succeeded = self.composition.succeeded.load(Ordering::Acquire);
+            // Record the attempt before sending it: an outcome-unknown update may have reached the
+            // host, so the final write has to close it. A definite rejection before dispatch is
+            // distinguishable below and can still use the normal non-TSF fallback.
+            self.composition.attempted.store(true, Ordering::Release);
+            match self
+                .submit_composition_outcome(
+                    crate::windows_ime_protocol::ImeSubmitOp::Update,
+                    text.clone(),
+                    false,
+                )
+                .await
+            {
+                Ok(WindowsCompositionSubmitResult::Status(
+                    crate::types::InsertStatus::Inserted,
+                )) => {
+                    self.composition.succeeded.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Ok(WindowsCompositionSubmitResult::Status(_)) => {
+                    // The native request was dispatched. StartComposition may have succeeded before
+                    // a later range/edit operation rejected the update, so retain the cleanup latch.
+                    self.composition.broken.store(true, Ordering::Release);
+                    return Err(BackendError::new(
+                        BackendErrorCode::Platform,
+                        "the host refused the composition update",
+                    ));
+                }
+                Ok(WindowsCompositionSubmitResult::CompositionRecoveryRequired(_)) => {
+                    if recovered {
+                        self.composition.broken.store(true, Ordering::Release);
+                        return Err(BackendError::new(
+                            BackendErrorCode::Platform,
+                            "the host still owns an abandoned TSF composition after recovery",
+                        ));
+                    }
+                    // Native recovery first cancels the prior process's context. Retry the same
+                    // update so the new composition is resolved from the current focused TSF context.
+                    self.clear_composition(false).await?;
+                    recovered = true;
+                }
+                Ok(WindowsCompositionSubmitResult::NotDispatched) => {
+                    // No native edit session started, so no composition cleanup is required.
+                    self.composition.attempted.store(false, Ordering::Release);
+                    self.composition.broken.store(true, Ordering::Release);
+                    return Err(BackendError::new(
+                        BackendErrorCode::Platform,
+                        "the host rejected the composition before dispatch",
+                    ));
+                }
+                Ok(WindowsCompositionSubmitResult::DefiniteFailure(error)) => {
+                    // A message rejected before dispatch cannot have opened a native composition. If
+                    // no earlier update succeeded, normal non-TSF fallback remains safe.
+                    if !had_succeeded {
+                        self.composition.attempted.store(false, Ordering::Release);
+                    }
+                    self.composition.broken.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Ok(WindowsCompositionSubmitResult::CompositionConflict(error)) => {
+                    // Another insertion owns native composition state. This insertion never
+                    // acquired ownership, so it must not retry cleanup with its owner or fall back
+                    // beside the other insertion's live composition.
+                    self.composition.attempted.store(false, Ordering::Release);
+                    self.composition.succeeded.store(false, Ordering::Release);
+                    self.composition.conflicted.store(true, Ordering::Release);
+                    self.composition.broken.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Err(error) => {
+                    // An outcome-unknown request may already have reached the host.
+                    self.composition.broken.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn restore_insertion_target(&self) -> Result<(), BackendError> {
+        crate::selection::reactivate_selection_insertion_target(&self.insertion_target)
+            .then_some(())
+            .ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Platform,
+                    "original text insertion target is unavailable",
+                )
+            })
+    }
+
+    async fn write_chunk(&self, text: String) -> Result<InsertWriteResult, BackendError> {
+        #[cfg(target_os = "macos")]
+        {
+            // A write future may have been created before a terminal caller
+            // sealed the session but only polled afterwards.
+            if self.finished.load(Ordering::Acquire) {
+                return Err(BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "text insertion session is closed",
+                ));
+            }
+            let worker = self.streaming_worker.as_ref().ok_or_else(|| {
+                BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "macOS streaming insertion is unavailable",
+                )
+            })?;
+            worker.write(text).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.restore_insertion_target()?;
+        #[cfg(target_os = "windows")]
+        {
+            // Defense in depth: composition owns the document until Finish. Typing
+            // Unicode keystrokes now would leave the raw transcript behind.
+            if self.composition_in_use() {
+                return Err(BackendError::new(
+                    BackendErrorCode::Unsupported,
+                    "streaming insertion is disabled while a composition is open",
+                ));
+            }
+            let chunk = text.clone();
+            #[cfg(target_os = "windows")]
+            let newline_mode = self.context.insertion.windows_sendinput_newline_mode;
+            let finished = Arc::clone(&self.finished);
+            let written = tauri::async_runtime::spawn_blocking(move || {
+                if finished.load(Ordering::Acquire) {
+                    return 0;
+                }
+                #[cfg(target_os = "windows")]
+                let result = crate::unicode_keystroke::type_unicode_chunk_with_options(
+                    &chunk,
+                    crate::unicode_keystroke::WindowsSendInputOptions { newline_mode },
+                );
+                let written = match result {
+                    Ok(written) => written,
+                    Err(error) => error.typed_chars(),
+                };
+                written
+            })
+            .await
+            .map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Internal,
+                    format!("join Tauri streaming insertion task: {error}"),
+                )
+            })?;
+            Ok(InsertWriteResult {
+                written_chars: written,
+            })
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let _ = text;
+            Err(BackendError::new(
+                BackendErrorCode::Unsupported,
+                "streaming insertion is unavailable on this platform",
+            ))
+        }
+    }
+
+    async fn insert_final(&self, text: String) -> Result<InsertOutcome, BackendError> {
+        #[cfg(target_os = "windows")]
+        {
+            if self.composition_conflicted() {
+                return Err(Self::composition_conflict_error());
+            }
+            if self.composition_in_use() {
+                // An empty final result cancels the composition rather than deleting the text
+                // that was selected when dictation began.
+                if text.is_empty() {
+                    self.clear_composition(false).await?;
+                    return Ok(InsertOutcome::Inserted);
+                }
+                // A composition owns its original TSF context. Revalidating the foreground
+                // selection first would reject a valid finish after the user changed focus.
+                let status = self
+                    .submit_composition(
+                        crate::windows_ime_protocol::ImeSubmitOp::Finish,
+                        text.clone(),
+                    )
+                    .await?;
+                if status == crate::types::InsertStatus::Inserted {
+                    return map_insert_status(status);
+                }
+                // Do not report a successful clipboard fallback while the raw composition is
+                // still visible. The caller retains the session and retries cleanup on cancel.
+                self.clear_composition(false).await?;
+                if self.context.insertion.allow_non_tsf_fallback {
+                    return self.copy_fallback(text).await;
+                }
+                return map_insert_status(status);
+            }
+            if self.composition.broken.load(Ordering::Acquire) {
+                // A composition update that was rejected before dispatch leaves no native range,
+                // but retrying a plain TSF commit could select an unrelated same-process thread.
+                // Reactivate the captured target and use the configured Windows fallback instead.
+                match self.restore_insertion_target() {
+                    Ok(()) => {}
+                    Err(error) => {
+                        #[cfg(target_os = "windows")]
+                        if self.context.insertion.allow_non_tsf_fallback {
+                            return self.copy_fallback(text).await;
+                        }
+                        return Err(error);
+                    }
+                }
+                if self.context.insertion.allow_non_tsf_fallback {
+                    return map_insert_status(windows_unicode_fallback(&self.context, &text));
+                }
+                return Err(BackendError::new(
+                    BackendErrorCode::Platform,
+                    "TSF composition could not be established on the captured target thread",
+                ));
+            }
+        }
+        if let Err(error) = self.restore_insertion_target() {
+            // When the original target is unavailable, copy only — never paste or send keystrokes to the current focus.
+            #[cfg(target_os = "windows")]
+            if self.context.insertion.allow_non_tsf_fallback {
+                return self.copy_fallback(text).await;
+            }
+            return Err(error);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let status = match self.context.insertion.windows_insertion_mode {
+                openless_core::shared_types::WindowsInsertionMode::Tsf => {
+                    let mut target = crate::windows_ime_target::capture_ime_submit_target();
+                    let mut recovered = false;
+                    let status = loop {
+                        let request = crate::windows_ime_ipc::ImeSubmitRequest {
+                            session_id: self.session_id.to_string(),
+                            text: text.clone(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            target,
+                            op: crate::windows_ime_protocol::ImeSubmitOp::Commit,
+                            composition_owner: 0,
+                            composition_process_id: composition_process_instance_id(),
+            allow_same_process_fallback: false,
+                        };
+                        match self.windows_ime.submit(request).await {
+                            Ok(status) => break status,
+                            Err(error) if error.is_outcome_unknown() => {
+                                log::warn!("[core-adapter] TSF outcome is unknown: {error}");
+                                return Err(BackendError::new(
+                                    BackendErrorCode::OutcomeUnknown,
+                                    error.to_string(),
+                                ));
+                            }
+                            Err(error) if error.is_composition_conflict() => {
+                                // A same-process insertion owns the native composition. This
+                                // session never acquired ownership, so it must not send a
+                                // wrong-owner Cancel.
+                                self.composition.conflicted.store(true, Ordering::Release);
+                                return Err(BackendError::new(
+                                    BackendErrorCode::Platform,
+                                    error.to_string(),
+                                ));
+                            }
+                            Err(error) if error.is_composition_recovery_required() => {
+                                if recovered {
+                                    self.composition.cleanup_required.store(true, Ordering::Release);
+                                    self.composition.conflicted.store(true, Ordering::Release);
+                                    return Err(BackendError::new(
+                                        BackendErrorCode::Platform,
+                                        "the prior TSF composition could not be recovered",
+                                    ));
+                                }
+                                // Cancel the prior process's context, reactivate the captured
+                                // target, and retry this same plain commit exactly once.
+                                self.composition.cleanup_required.store(true, Ordering::Release);
+                                self.clear_composition(true).await?;
+                                if let Err(error) = self.restore_insertion_target() {
+                                    if self.context.insertion.allow_non_tsf_fallback {
+                                        return self.copy_fallback(text).await;
+                                    }
+                                    return Err(error);
+                                }
+                                target = crate::windows_ime_target::capture_ime_submit_target();
+                                recovered = true;
+                            }
+                            Err(error) => {
+                                log::warn!("[core-adapter] TSF submit failed: {error}");
+                                break crate::types::InsertStatus::Failed;
+                            }
+                        }
+                    };
+                    if status == crate::types::InsertStatus::Failed
+                        && self.context.insertion.allow_non_tsf_fallback
+                    {
+                        windows_unicode_fallback(&self.context, &text)
+                    } else {
+                        status
+                    }
+                }
+                openless_core::shared_types::WindowsInsertionMode::SendInput => {
+                    windows_unicode_fallback(&self.context, &text)
+                }
+                openless_core::shared_types::WindowsInsertionMode::Paste => {
+                    let backend = Arc::clone(&self.backend);
+                    let observe = self.context.insertion.observe_edits;
+                    let restore = self.context.insertion.restore_clipboard_after_paste;
+                    let shortcut = self.context.insertion.paste_shortcut;
+                    tauri::async_runtime::spawn_blocking(move || {
+                        crate::host_document::insert_with_delivery_check(
+                            &text,
+                            || {
+                                observe
+                                    && backend
+                                        .lock()
+                                        .as_ref()
+                                        .and_then(|b| b.upgrade())
+                                        .is_some_and(|b| {
+                                            b.get_preferences().vocabulary_learning_enabled
+                                        })
+                            },
+                            || {
+                                crate::insertion::TextInserter::new()
+                                    .insert(&text, restore, shortcut)
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        BackendError::new(BackendErrorCode::Internal, error.to_string())
+                    })?
+                }
+            };
+            return map_insert_status(status);
+        }
+        #[cfg(target_os = "android")]
+        {
+            return map_insert_status(crate::android::android_insert_with_strategy(
+                &crate::insertion::TextInserter::new(),
+                &text,
+                self.context.insertion.android_insert_strategy,
+            ));
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "android")))]
+        {
+            let restore = self.context.insertion.restore_clipboard_after_paste;
+            let shortcut = self.context.insertion.paste_shortcut;
+            tauri::async_runtime::spawn_blocking(move || {
+                map_insert_status(
+                    crate::insertion::TextInserter::new().insert(&text, restore, shortcut),
+                )
+            })
+            .await
+            .map_err(|error| {
+                BackendError::new(
+                    BackendErrorCode::Internal,
+                    format!("join Tauri insertion task: {error}"),
+                )
+            })?
+        }
+    }
+
+    async fn copy_fallback(&self, text: String) -> Result<InsertOutcome, BackendError> {
+        tauri::async_runtime::spawn_blocking(move || {
+            map_insert_status(crate::insertion::TextInserter::new().copy_fallback(&text))
+        })
+        .await
+        .map_err(|error| {
+            BackendError::new(
+                BackendErrorCode::Internal,
+                format!("join Tauri clipboard fallback task: {error}"),
+            )
+        })?
+    }
+
+    async fn restore_platform_state(&self) -> Result<(), BackendError> {
+        #[cfg(target_os = "macos")]
+        {
+            let previous_input_source = self.previous_input_source.lock().take();
+            crate::unicode_keystroke::restore_input_source(&self.app, previous_input_source)
+                .await
+                .map_err(|error| {
+                    BackendError::new(BackendErrorCode::Platform, error.to_string())
+                })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finalize_mac(
+        self,
+        final_text: Option<String>,
+    ) -> Result<MacInsertionCompletion, BackendError> {
+        self.finished.store(true, Ordering::Release);
+        if final_text.is_none() {
+            // Separate from the normal finished latch: normal finish must not
+            // cancel Write commands already accepted by the worker's queue.
+            self.cancel_requested.store(true, Ordering::Release);
+        }
+        let terminal = Arc::clone(&self.terminal);
+        terminal
+            .join_or_spawn(
+                move || async move {
+                    let worker = self.streaming_worker.clone();
+                    let session = &self;
+                    finish_mac_insertion_after_barrier(
+                        async move {
+                            match worker {
+                                Some(worker) => worker.finish().await,
+                                None => Ok(()),
+                            }
+                        },
+                        move || async move {
+                            if session.cancel_requested.load(Ordering::Acquire) {
+                                return Ok(MacInsertionCompletion::Cancelled);
+                            }
+                            match final_text {
+                                Some(text) if !text.is_empty() => session
+                                    .insert_final(text)
+                                    .await
+                                    .map(MacInsertionCompletion::Finished),
+                                Some(_) => {
+                                    Ok(MacInsertionCompletion::Finished(InsertOutcome::Inserted))
+                                }
+                                None => Ok(MacInsertionCompletion::Cancelled),
+                            }
+                        },
+                        || session.restore_platform_state(),
+                    )
+                    .await
+                },
+                |task| {
+                    tauri::async_runtime::spawn(task);
+                },
+            )
+            .await
+    }
+}
+
+impl TextInsertionSession for TauriTextInsertionSession {
+    fn supports_streaming(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.streaming_ready
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            cfg!(target_os = "windows")
+        }
+    }
+
+    fn write(&self, text: String) -> BoxFuture<'static, Result<InsertWriteResult, BackendError>> {
+        if self.finished.load(Ordering::Acquire) {
+            return Box::pin(async {
+                Err(BackendError::new(
+                    BackendErrorCode::Cancelled,
+                    "text insertion session is closed",
+                ))
+            });
+        }
+        let session = self.clone();
+        Box::pin(async move { session.write_chunk(text).await })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_composition(&self, text: String) -> BoxFuture<'static, Result<(), BackendError>> {
+        let session = self.clone();
+        Box::pin(async move { session.update_composition_text(text).await })
+    }
+
+    fn copy(&self, text: String) -> BoxFuture<'static, Result<(), BackendError>> {
+        let session = self.clone();
+        Box::pin(async move { session.copy_fallback(text).await.map(|_| ()) })
+    }
+
+    fn finish(
+        &self,
+        final_text: String,
+    ) -> BoxFuture<'static, Result<InsertOutcome, BackendError>> {
+        let session = self.clone();
+        Box::pin(async move {
+            #[cfg(target_os = "macos")]
+            {
+                match session.finalize_mac(Some(final_text)).await? {
+                    MacInsertionCompletion::Finished(outcome) => Ok(outcome),
+                    MacInsertionCompletion::Cancelled => Err(BackendError::new(
+                        BackendErrorCode::Cancelled,
+                        "text insertion session was cancelled before completion",
+                    )),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if session.finished.swap(true, Ordering::AcqRel) {
+                    return Err(BackendError::new(
+                        BackendErrorCode::InvalidState,
+                        "text insertion session is already closed",
+                    ));
+                }
+                // An empty final text still has to clear a live composition.
+                let result = if final_text.is_empty()
+                    && !session.composition_in_use()
+                    && !session.composition_conflicted()
+                {
+                    Ok(InsertOutcome::Inserted)
+                } else {
+                    session.insert_final(final_text).await
+                };
+                if let Err(error) = session.restore_platform_state().await {
+                    // A failed input-source restore cannot undo text already inserted. Keep the
+                    // real delivery outcome — historically a false failure prompted retries that
+                    // duplicated text; log the restore error regardless of insertion success.
+                    log::warn!(
+                        "[core-adapter] restore input state after insertion failed: {error}"
+                    );
+                }
+                if result.is_err() {
+                    // Keep the session cancellable so a failed or uncertain composition finish
+                    // can still clear native TSF state before the registry entry is removed.
+                    session.finished.store(false, Ordering::Release);
+                }
+                result
+            }
+        })
+    }
+
+    fn cancel(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+        let session = self.clone();
+        Box::pin(async move {
+            #[cfg(target_os = "macos")]
+            {
+                session.finalize_mac(None).await.map(|_| ())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if session.finished.swap(true, Ordering::AcqRel) {
+                    return Ok(());
+                }
+                let result = async {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if session.composition_in_use() || session.composition_cleanup_required() {
+                            // Cancelled dictation must not leave its transcript in the document.
+                            // A plain TSF commit can also discover an orphaned composition before
+                            // this session has sent any update; clear that recovery obligation here.
+                            let allow_same_process_fallback =
+                                session.composition_cleanup_required();
+                            session
+                                .clear_composition(allow_same_process_fallback)
+                                .await?;
+                        }
+                    }
+                    session.restore_platform_state().await
+                }
+                .await;
+                if result.is_err() {
+                    // Keep a failed cancellation retryable so a transient native cleanup or
+                    // platform restore failure cannot strand the composition permanently.
+                    session.finished.store(false, Ordering::Release);
+                }
+                result
+            }
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mac_insertion_lifecycle_tests {
+    use super::*;
+
+    fn spawn(task: BoxFuture<'static, ()>) {
+        tokio::spawn(task);
+    }
+
+    #[tokio::test]
+    async fn worker_start_failure_restores_the_previous_source_once() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let error = BackendError::new(BackendErrorCode::Platform, "worker unavailable");
+        let result = start_worker_restoring_on_error(
+            7,
+            || Err::<(), _>(error.clone()),
+            |token| {
+                let restored = &restored;
+                async move {
+                    restored.lock().push(token);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), error);
+        assert_eq!(*restored.lock(), [7]);
+        assert_eq!(
+            start_worker_restoring_on_error(
+                8,
+                || Ok(9),
+                |_| async {
+                    panic!("successful startup must retain the source for terminal cleanup")
+                }
+            )
+            .await
+            .unwrap(),
+            (8, 9)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_barrier_skips_insertion_but_still_restores() {
+        let actions = Mutex::new(Vec::new());
+        let error = BackendError::new(BackendErrorCode::Internal, "worker stopped");
+        let result = finish_mac_insertion_after_barrier(
+            async {
+                actions.lock().push("barrier");
+                Err(error.clone())
+            },
+            || async { panic!("uncertain posted input must not be inserted again") },
+            || async {
+                actions.lock().push("restore");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), error);
+        assert_eq!(*actions.lock(), ["barrier", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn failed_final_insertion_still_restores_and_preserves_its_error() {
+        let actions = Mutex::new(Vec::new());
+        let error = BackendError::new(BackendErrorCode::Platform, "target unavailable");
+        let result = finish_mac_insertion_after_barrier(
+            async {
+                actions.lock().push("barrier");
+                Ok(())
+            },
+            || async {
+                actions.lock().push("insert");
+                Err(error.clone())
+            },
+            || async {
+                actions.lock().push("restore");
+                Err(BackendError::new(
+                    BackendErrorCode::Platform,
+                    "TIS unavailable",
+                ))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), error);
+        assert_eq!(*actions.lock(), ["barrier", "insert", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn restoration_error_keeps_written_outcome_but_is_reported_on_cancel() {
+        let error = BackendError::new(BackendErrorCode::Platform, "TIS unavailable");
+        let completed = MacInsertionCompletion::Finished(InsertOutcome::Inserted);
+        assert_eq!(
+            finish_mac_insertion_after_barrier(
+                async { Ok(()) },
+                || async { Ok(completed) },
+                || async { Err(error.clone()) },
+            )
+            .await
+            .unwrap(),
+            completed
+        );
+        assert_eq!(
+            finish_mac_insertion_after_barrier(
+                async { Ok(()) },
+                || async { Ok(MacInsertionCompletion::Cancelled) },
+                || async { Err(error.clone()) },
+            )
+            .await
+            .unwrap_err(),
+            error
+        );
+    }
+
+    async fn assert_terminal_join(completion: MacInsertionCompletion, drop_first: bool) {
+        let terminal = Arc::new(MacInsertionTerminal::default());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let observed = Arc::clone(&actions);
+        let start = Arc::clone(&entered);
+        let gate = Arc::clone(&release);
+        let mut first = Box::pin(terminal.join_or_spawn(
+            move || async move {
+                let observed = &observed;
+                finish_mac_insertion_after_barrier(
+                    async {
+                        observed.lock().push("barrier started");
+                        start.add_permits(1);
+                        gate.acquire().await.unwrap().forget();
+                        observed.lock().push("barrier drained");
+                        Ok(())
+                    },
+                    || async {
+                        observed.lock().push("effect");
+                        Ok(completion)
+                    },
+                    || async {
+                        observed.lock().push("source restored");
+                        Ok(())
+                    },
+                )
+                .await
+            },
+            spawn,
+        ));
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        entered.acquire().await.unwrap().forget();
+        assert_eq!(*actions.lock(), ["barrier started"]);
+        let mut second = std::pin::pin!(terminal.join_or_spawn(
+            || async { panic!("duplicate terminal call must not repeat effects") },
+            spawn,
+        ));
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        let first = if drop_first {
+            drop(first);
+            None
+        } else {
+            Some(first)
+        };
+        release.add_permits(1);
+        assert_eq!(second.await.unwrap(), completion);
+        if let Some(first) = first {
+            assert_eq!(first.await.unwrap(), completion);
+        }
+        assert_eq!(
+            *actions.lock(),
+            [
+                "barrier started",
+                "barrier drained",
+                "effect",
+                "source restored"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_finish_and_cancel_wait_for_the_same_terminal_barrier() {
+        for completion in [
+            MacInsertionCompletion::Finished(InsertOutcome::Inserted),
+            MacInsertionCompletion::Cancelled,
+        ] {
+            assert_terminal_join(completion, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_initial_terminal_future_does_not_skip_restore() {
+        for completion in [
+            MacInsertionCompletion::Finished(InsertOutcome::Inserted),
+            MacInsertionCompletion::Cancelled,
+        ] {
+            assert_terminal_join(completion, true).await;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_unicode_fallback(context: &DictationContext, text: &str) -> crate::types::InsertStatus {
+    let inserter = crate::insertion::TextInserter::new();
+    let status = inserter.insert_via_unicode_keystrokes(
+        text,
+        crate::unicode_keystroke::WindowsSendInputOptions {
+            newline_mode: context.insertion.windows_sendinput_newline_mode,
+        },
+    );
+    if status == crate::types::InsertStatus::Inserted || !context.insertion.allow_non_tsf_fallback {
+        status
+    } else {
+        inserter.copy_fallback(text)
+    }
+}
+
+fn map_insert_status(status: crate::types::InsertStatus) -> Result<InsertOutcome, BackendError> {
+    match status {
+        crate::types::InsertStatus::Inserted => Ok(InsertOutcome::Inserted),
+        crate::types::InsertStatus::PasteSent => Ok(InsertOutcome::PasteSent),
+        crate::types::InsertStatus::CopiedFallback => Ok(InsertOutcome::CopiedFallback),
+        crate::types::InsertStatus::Failed | crate::types::InsertStatus::NotRequested => Err(
+            BackendError::new(BackendErrorCode::Platform, "Tauri text insertion failed"),
+        ),
+    }
+}
+
+#[derive(Default)]
+struct TauriHostContextAdapter {
+    target: Option<crate::selection::SelectionInsertionTarget>,
+}
+
+impl TauriHostContextAdapter {
+    fn for_target(target: crate::selection::SelectionInsertionTarget) -> Self {
+        Self {
+            target: Some(target),
+        }
+    }
+}
+
+impl openless_core::HostContextAdapter for TauriHostContextAdapter {
+    fn capture(
+        &self,
+        include_cursor: bool,
+    ) -> BoxFuture<'static, Result<openless_core::HostContextCapture, BackendError>> {
+        let target = self.target.clone();
+
+        Box::pin(async move {
+            let front_app = match target.as_ref() {
+                Some(target) => crate::selection::front_app_for_target(target),
+                None => crate::coordinator::capture_frontmost_app(),
+            };
+
+            let cursor_context = if include_cursor {
+                let started = std::time::Instant::now();
+                let window = match target {
+                    Some(target) => {
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
+                        {
+                            crate::host_document::read_around_cursor_for_target(
+                                crate::host_document::DEFAULT_BUDGET_CHARS,
+                                target,
+                            )
+                            .await
+                        }
+                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                        {
+                            let _ = target;
+                            crate::host_document::read_around_cursor(
+                                crate::host_document::DEFAULT_BUDGET_CHARS,
+                            )
+                            .await
+                        }
+                    }
+                    None => {
+                        crate::host_document::read_around_cursor(
+                            crate::host_document::DEFAULT_BUDGET_CHARS,
+                        )
+                        .await
+                    }
+                };
+
+                // Metadata only — never the document body (design doc §18/§19). Do not include
+                // the foreground window title here; Windows titles can contain document paths,
+                // URLs, subjects, customer names, or account identifiers.
+                match &window {
+                    Some(window) => log::info!(
+                        "[cursor-context] status=ok chars_before={} chars_after={} elapsed_ms={}",
+                        window.before().chars().count(),
+                        window.after().chars().count(),
+                        started.elapsed().as_millis(),
+                    ),
+                    None => log::info!(
+                        "[cursor-context] status=none elapsed_ms={}",
+                        started.elapsed().as_millis(),
+                    ),
+                }
+                window.map(|window| {
+                    let before = window.text.chars().take(window.cursor).collect::<String>();
+                    let after = window.text.chars().skip(window.cursor).collect::<String>();
+                    openless_core::prompts::cursor_context_input(&before, &after)
+                })
+            } else {
+                None
+            };
+            Ok(openless_core::HostContextCapture {
+                front_app,
+                cursor_context,
+            })
+        })
+    }
+}
+
+pub(crate) struct TauriHostActions {
+    app: AppHandleSlot,
+    qa_context: Arc<crate::qa_adapter::TauriQaHostContext>,
+}
+
+impl TauriHostActions {
+    pub(crate) fn new(
+        app: AppHandleSlot,
+        qa_context: Arc<crate::qa_adapter::TauriQaHostContext>,
+    ) -> Self {
+        Self { app, qa_context }
+    }
+
+    fn app(&self) -> Result<AppHandle, BackendError> {
+        self.app.lock().clone().ok_or_else(|| {
+            BackendError::new(
+                BackendErrorCode::InvalidState,
+                "Tauri AppHandle is not bound yet",
+            )
+        })
+    }
+}
+
+impl HostActions for TauriHostActions {
+    fn request(&self, action: HostAction) -> Result<(), BackendError> {
+        let app = self.app()?;
+        match action {
+            HostAction::ShowMain | HostAction::FocusMain => crate::show_main_window(&app),
+            HostAction::ShowDictationFeedback | HostAction::HideDictationFeedback => {}
+            HostAction::ShowSelectionPreview => crate::show_selection_polish_preview(&app),
+            HostAction::HideSelectionPreview => crate::hide_selection_polish_preview(&app),
+            HostAction::ShowQa => {
+                self.qa_context.prepare_show();
+                crate::show_qa_window(&app, "idle");
+            }
+            HostAction::HideQa => {
+                self.qa_context.clear();
+                crate::hide_qa_window(&app);
+            }
+            HostAction::ShowLessComputer => {
+                crate::show_less_computer_window(&app).map_err(map_tauri_error)?;
+            }
+            HostAction::OpenExternalUrl(url) => {
+                use tauri_plugin_shell::ShellExt;
+                app.shell().open(url, None).map_err(map_tauri_error)?;
+            }
+            HostAction::OpenSystemSettings(page) => {
+                crate::commands::open_system_settings(page)
+                    .map_err(|message| BackendError::new(BackendErrorCode::Platform, message))?;
+            }
+            HostAction::RequestRestart => {
+                crate::prepare_for_restart();
+                app.restart();
+            }
+            HostAction::Notify(message) => {
+                app.emit("core:notification", message)
+                    .map_err(map_tauri_error)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn map_tauri_error(error: impl std::fmt::Display) -> BackendError {
+    BackendError::new(BackendErrorCode::Platform, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn foundry_notices_publish_before_transcription_finishes_and_stop_after_release() {
+        use crate::asr::local::foundry_runtime::FoundryFallbackNotice;
+        let directory =
+            std::env::temp_dir().join(format!("openless-foundry-notice-{}", uuid::Uuid::new_v4()));
+        let backend = Arc::new(
+            openless_core::OpenLessBackend::new(
+                openless_core::BackendConfig {
+                    data_dir: directory.clone(),
+                    ..Default::default()
+                },
+                openless_core::BackendDependencies::unsupported(),
+            )
+            .unwrap(),
+        );
+        let slot = backend_slot();
+        *slot.lock() = Some(Arc::downgrade(&backend));
+        let session_id = SessionId::new();
+        let released = Arc::new(AtomicBool::new(false));
+        let callback = foundry_transcription_notices(slot, session_id, Arc::clone(&released));
+        let mut events = backend.subscribe();
+        for notice in [
+            FoundryFallbackNotice::SwitchingToCpu,
+            FoundryFallbackNotice::DownloadingCpu,
+        ] {
+            callback(notice);
+            let event = events
+                .try_recv()
+                .expect("native notice must reach the UI while transcription is still pending");
+            assert_eq!(event.session_id, Some(session_id));
+            assert!(matches!(event.kind,
+                openless_core::BackendEventKind::Notification(ref payload)
+                    if payload.message == notice.message()));
+        }
+        released.store(true, Ordering::Release);
+        callback(FoundryFallbackNotice::DownloadingCpu);
+        assert_eq!(
+            events.try_recv().unwrap_err(),
+            openless_core::EventRecvError::Empty
+        );
+        drop(backend);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn optional_recording_preparation_failure_keeps_microphone_options_usable() {
+        // Replace only the filesystem/output-mute boundaries here; don't start a real microphone
+        // or change system volume. Both 1.x preparations are allowed to fail, and their results
+        // must still be handed to Recorder::start.
+        let mut options = Vec::new();
+        for (archive_fails, mute_fails) in [(true, false), (false, true), (true, true)] {
+            let archive_result = if archive_fails {
+                Err("recordings directory cannot be created")
+            } else {
+                Ok(Some(PathBuf::from("fixture.wav")))
+            };
+            let (archive, mute) = prepare_recording_options(archive_result, true, || {
+                if mute_fails {
+                    Err("default render endpoint is unavailable".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+            options.push((archive.is_some(), mute.is_some()));
+        }
+        assert_eq!(
+            options,
+            vec![(false, true), (true, false), (false, false)],
+            "optional effects must not prevent capture"
+        );
+    }
+
+    #[test]
+    fn optional_recording_preparation_preserves_guard_ownership_and_disabled_behavior() {
+        struct MuteGuard(Arc<AtomicU64>);
+        impl Drop for MuteGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let restored = Arc::new(AtomicU64::new(0));
+        let path = PathBuf::from("fixture.wav");
+        let (archive, mute) =
+            prepare_recording_options(Ok::<_, String>(Some(path.clone())), true, || {
+                Ok(MuteGuard(Arc::clone(&restored)))
+            });
+        assert_eq!(archive, Some(path.clone()));
+        assert_eq!(restored.load(Ordering::SeqCst), 0);
+        // A successful guard must be handed to the recording resources, not restore the volume early at the end of preparation.
+        drop(mute);
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+        let (archive, mute) =
+            prepare_recording_options(Ok::<_, String>(None), false, || -> Result<(), String> {
+                panic!("disabled muting must not call the platform")
+            });
+        assert!(archive.is_none());
+        assert!(mute.is_none());
+        let (archive, mute) = prepare_recording_options(
+            Ok::<_, String>(Some(path.clone())),
+            false,
+            || -> Result<(), String> { panic!("disabled muting must not call the platform") },
+        );
+        assert_eq!(archive, Some(path));
+        assert!(mute.is_none());
+    }
+
+    #[test]
+    fn native_callback_tasks_run_on_the_tauri_host_runtime() {
+        use openless_core::TaskSpawner;
+
+        // The application executor is alive, but cpal callbacks and native
+        // destructors run on ordinary OS threads without Tokio's thread-local
+        // context. Test that boundary instead of calling spawn inside tokio::test.
+        let _host_runtime = tauri::async_runtime::handle();
+        let (completed, completion) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            TauriTaskSpawner.spawn(Box::pin(async move {
+                // A timer also proves the task has the host's runtime services,
+                // not merely a manually polled future on the callback thread.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                completed.send(()).unwrap();
+            }));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            completion.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(()),
+            "native audio/cancellation work must not be dropped outside Tokio threads"
+        );
+    }
+
+    #[cfg(not(mobile))]
+    #[derive(Default)]
+    struct TestSelectionPlatformBridge {
+        capture_calls: std::sync::atomic::AtomicUsize,
+        apply_calls: Mutex<Vec<(String, String, bool)>>,
+        revert_calls: Mutex<usize>,
+    }
+
+    #[cfg(not(mobile))]
+    impl SelectionPlatformBridge for TestSelectionPlatformBridge {
+        fn capture(
+            &self,
+        ) -> Result<
+            (
+                openless_core::SelectionCapture,
+                crate::selection::SelectionInsertionTarget,
+            ),
+            BackendError,
+        > {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok((
+                openless_core::SelectionCapture {
+                    text: "source".to_string(),
+                    source_app: Some("Editor".to_string()),
+                },
+                crate::selection::SelectionInsertionTarget::default(),
+            ))
+        }
+
+        fn apply(
+            &self,
+            _target: &crate::selection::SelectionInsertionTarget,
+            source_text: &str,
+            replacement_text: &str,
+            reactivate: bool,
+        ) -> Result<InsertOutcome, BackendError> {
+            self.apply_calls.lock().push((
+                source_text.to_string(),
+                replacement_text.to_string(),
+                reactivate,
+            ));
+            Ok(InsertOutcome::Inserted)
+        }
+
+        fn revert(
+            &self,
+            _target: &crate::selection::SelectionInsertionTarget,
+        ) -> Result<InsertOutcome, BackendError> {
+            *self.revert_calls.lock() += 1;
+            Ok(InsertOutcome::Inserted)
+        }
+    }
+
+    struct IgnoreTextStreamSink;
+
+    #[test]
+    fn local_asr_keep_loaded_delay_distinguishes_immediate_finite_and_forever() {
+        assert_eq!(
+            super::local_asr_release_delay(0),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            super::local_asr_release_delay(300),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            super::local_asr_release_delay(openless_core::LOCAL_ASR_KEEP_LOADED_FOREVER_SECS),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_preload_requires_the_requested_model_to_be_prepared() {
+        use openless_core::{LocalAsrRuntime, LocalAsrTarget, ModelRuntimeAdapter};
+
+        let adapter = TauriLocalAsrRuntimeAdapter::new(
+            TauriNativeAsrDependencies::new(
+                Arc::new(crate::asr::local::FoundryLocalRuntime::new()),
+                Arc::new(crate::asr::local::SherpaOnnxRuntime::new()),
+            ),
+        );
+        // This is the production adapter's real unprepared state; a standalone preload call must
+        // not fake success nor claim the whole Windows runtime Unsupported. The test does not
+        // download/load device models.
+        for runtime in [LocalAsrRuntime::Foundry, LocalAsrRuntime::SherpaOnnx] {
+            let target = LocalAsrTarget::parse(runtime, runtime.default_model()).unwrap();
+            let error = adapter
+                .preload(target, PathBuf::new(), runtime.provider_id().to_string())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, BackendErrorCode::InvalidState);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_scheduled_release_invalidation_is_runtime_scoped() {
+        use openless_core::{LocalAsrRuntime, ModelRuntimeAdapter};
+
+        let adapter = TauriLocalAsrRuntimeAdapter::new(
+            TauriNativeAsrDependencies::new(
+                Arc::new(crate::asr::local::FoundryLocalRuntime::new()),
+                Arc::new(crate::asr::local::SherpaOnnxRuntime::new()),
+            ),
+        );
+        let stale_foundry_generation = adapter.native.foundry_generation.load(Ordering::Acquire);
+        adapter.invalidate_scheduled_release(LocalAsrRuntime::Foundry);
+        assert_eq!(adapter.native.foundry_generation.load(Ordering::Acquire), 1);
+        assert_eq!(adapter.native.sherpa_generation.load(Ordering::Acquire), 0);
+        assert!(!adapter
+            .native
+            .foundry
+            .release_if_generation(
+                adapter.native.foundry_generation.as_ref(),
+                stale_foundry_generation,
+            )
+            .await
+            .unwrap());
+        adapter.invalidate_scheduled_release(LocalAsrRuntime::SherpaOnnx);
+        assert_eq!(adapter.native.foundry_generation.load(Ordering::Acquire), 1);
+        assert_eq!(adapter.native.sherpa_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn input_source_preparation_skips_one_shot_and_degrades_on_tis_failure() {
+        let (previous, streaming) = prepare_streaming_input_source(false, || async {
+            panic!("one-shot insertion must not access TIS");
+            #[allow(unreachable_code)]
+            Ok::<Option<u8>, &str>(Some(1))
+        })
+        .await;
+        assert_eq!(previous, None);
+        assert!(!streaming);
+        let (previous, streaming) = prepare_streaming_input_source(true, || async {
+            Err::<Option<u8>, _>("TIS select failed")
+        })
+        .await;
+        assert_eq!(previous, None);
+        assert!(!streaming);
+        assert_eq!(
+            prepare_streaming_input_source(true, || async { Ok::<_, &str>(Some(7_u8)) }).await,
+            (Some(7), true)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn legacy_runtime_rejects_prepare_and_preload_without_any_engine() {
+        use openless_core::{LocalAsrRuntime, LocalAsrTarget, ModelRuntimeAdapter};
+        let adapter = TauriLocalAsrRuntimeAdapter::new(TauriNativeAsrDependencies::new());
+        let target = LocalAsrTarget::parse(LocalAsrRuntime::Generic, "qwen3-asr-0.6b").unwrap();
+        let error = adapter.prepare(target.clone(), openless_core::FoundryRuntimeSource::Auto,
+            PathBuf::new(), Arc::new(|_| {})).await.unwrap_err();
+        assert_eq!(error.code, BackendErrorCode::Unsupported);
+        let error = adapter.preload(target, PathBuf::new(), "local-qwen3-c".into()).await.unwrap_err();
+        assert_eq!(error.code, BackendErrorCode::Unsupported);
+    }
+
+    impl TextStreamSink for IgnoreTextStreamSink {
+        fn publish(&self, _chunk: TextStreamChunk) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn insertion_status_mapping_preserves_fallback_and_failure_semantics() {
+        assert_eq!(
+            map_insert_status(crate::types::InsertStatus::Inserted).unwrap(),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            map_insert_status(crate::types::InsertStatus::CopiedFallback).unwrap(),
+            InsertOutcome::CopiedFallback
+        );
+        assert_eq!(
+            map_insert_status(crate::types::InsertStatus::PasteSent).unwrap(),
+            InsertOutcome::PasteSent
+        );
+        assert_eq!(
+            map_insert_status(crate::types::InsertStatus::Failed)
+                .unwrap_err()
+                .code,
+            BackendErrorCode::Platform
+        );
+    }
+
+    #[test]
+    fn platform_permission_mapping_preserves_every_legacy_state() {
+        let cases = [
+            (
+                crate::permissions::PermissionStatus::Granted,
+                openless_core::PermissionState::Granted,
+            ),
+            (
+                crate::permissions::PermissionStatus::Denied,
+                openless_core::PermissionState::Denied,
+            ),
+            (
+                crate::permissions::PermissionStatus::NotDetermined,
+                openless_core::PermissionState::Unknown,
+            ),
+            (
+                crate::permissions::PermissionStatus::Restricted,
+                openless_core::PermissionState::Restricted,
+            ),
+            (
+                crate::permissions::PermissionStatus::NotApplicable,
+                openless_core::PermissionState::Unsupported,
+            ),
+            (
+                crate::permissions::PermissionStatus::NoDevice,
+                openless_core::PermissionState::NoDevice,
+            ),
+        ];
+
+        for (legacy, core) in cases {
+            assert_eq!(map_permission_state(legacy), core);
+        }
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn cancelled_selection_target_rejects_an_unpolled_apply() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+
+        let pending_apply = openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            session_id,
+            "source".to_string(),
+            "replacement".to_string(),
+        );
+        openless_core::SelectionRuntimeAdapter::cancel(&runtime, session_id)
+            .await
+            .unwrap();
+
+        let error = pending_apply.await.unwrap_err();
+        assert_eq!(error.code, BackendErrorCode::Cancelled);
+        assert!(bridge.apply_calls.lock().is_empty());
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn direct_selection_apply_does_not_reactivate_the_capture_target() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+
+        openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            session_id,
+            "source".to_string(),
+            "replacement".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bridge.apply_calls.lock().as_slice(),
+            &[("source".to_string(), "replacement".to_string(), false)]
+        );
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn a_new_selection_capture_invalidates_the_previous_target() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let previous_session = SessionId::new();
+        let current_session = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, previous_session, None)
+            .await
+            .unwrap();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, current_session, None)
+            .await
+            .unwrap();
+
+        let error = openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            previous_session,
+            "source".to_string(),
+            "stale replacement".to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, BackendErrorCode::Cancelled);
+        assert!(bridge.apply_calls.lock().is_empty());
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn preview_selection_apply_reactivates_the_capture_target() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+        openless_core::SelectionRuntimeAdapter::prepare_preview(&runtime, session_id)
+            .await
+            .unwrap();
+
+        openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            session_id,
+            "source".to_string(),
+            "replacement".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bridge.apply_calls.lock().as_slice(),
+            &[("source".to_string(), "replacement".to_string(), true)]
+        );
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn cancelled_selection_target_rejects_apply_and_revert() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+        openless_core::SelectionRuntimeAdapter::cancel(&runtime, session_id)
+            .await
+            .unwrap();
+
+        let apply_error = openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            session_id,
+            "source".to_string(),
+            "replacement".to_string(),
+        )
+        .await
+        .unwrap_err();
+        let revert_error = openless_core::SelectionRuntimeAdapter::revert(&runtime, session_id)
+            .await
+            .unwrap_err();
+
+        assert_eq!(apply_error.code, BackendErrorCode::Cancelled);
+        assert_eq!(revert_error.code, BackendErrorCode::Cancelled);
+        assert!(bridge.apply_calls.lock().is_empty());
+        assert_eq!(*bridge.revert_calls.lock(), 0);
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn duplicate_selection_capture_does_not_replace_the_original_target() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+
+        let error = openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap_err();
+        openless_core::SelectionRuntimeAdapter::apply(
+            &runtime,
+            session_id,
+            "source".to_string(),
+            "replacement".to_string(),
+        )
+        .await
+        .expect("the original target should remain active");
+
+        assert_eq!(error.code, BackendErrorCode::Busy);
+        assert_eq!(
+            bridge
+                .capture_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        assert_eq!(bridge.apply_calls.lock().len(), 1);
+    }
+
+    #[cfg(not(mobile))]
+    #[tokio::test]
+    async fn selection_revert_is_delegated_once_to_the_platform_bridge() {
+        let bridge = Arc::new(TestSelectionPlatformBridge::default());
+        let runtime = TauriSelectionRuntime::with_bridge(bridge.clone());
+        let session_id = SessionId::new();
+        openless_core::SelectionRuntimeAdapter::capture(&runtime, session_id, None)
+            .await
+            .unwrap();
+
+        let outcome = openless_core::SelectionRuntimeAdapter::revert(&runtime, session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        assert_eq!(*bridge.revert_calls.lock(), 1);
+    }
+}

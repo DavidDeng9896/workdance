@@ -37,13 +37,22 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
-      - name: cargo test (core + vision stub + input)
+      - name: cargo test (core + vision stub + input + gesture gate)
         env:
           WORKDANCE_VISION_STUB: "1"
         run: |
           cargo test -p workdance-core
           cargo test -p workdance-vision
           cargo test -p workdance-input
+          cargo test -p workdance-gesture
+
+      - name: cargo check gesture MediaPipe FFI feature
+        run: cargo check -p workdance-gesture --features mediapipe
+
+      # OpenLess core is the dictation host. The Tauri shell itself refuses Linux
+      # (upstream uses linux-egui there); Win/mac `cargo check` is in SELFTEST.md.
+      - name: cargo check vendored OpenLess core
+        run: cargo check -p openless-core --manifest-path vendor/openless/Cargo.toml
 
       # Feature compiles via libloading (no native MediaPipe required).
       - name: cargo check mediapipe-hands feature
