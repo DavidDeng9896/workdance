@@ -589,4 +589,168 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(g.snapshot().gate_state, TrayState::Idle);
     }
+
+    /// G-07 skeleton: 20 synthetic short-vs-long fist trials, no camera.
+    /// Thresholds stay provisional; wrong count must be ≤1 for the batch to pass.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum G07Kind {
+        Short,
+        Long,
+    }
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)] // kept for fail diagnostics / Aegis
+    struct G07Trial {
+        index: usize,
+        kind: G07Kind,
+        hold_ms: u64,
+        got_click: bool,
+        got_dictation_pressed: bool,
+        wrong: bool,
+    }
+
+    fn run_short_trial(hold_ms: u64) -> (bool, bool) {
+        let mut g = gate();
+        let _ = see(&mut g, 0, Some(open_palm(0.0, 0.0)));
+        let _ = see(&mut g, 10, Some(fist_at(0.0, 0.0)));
+        let out = see(&mut g, 10 + hold_ms, Some(open_palm(0.0, 0.0)));
+        let got_click = out.iter().any(|d| matches!(d, Decision::Click));
+        let got_dictation = out
+            .iter()
+            .any(|d| matches!(d, Decision::DictationPressed));
+        (got_click, got_dictation)
+    }
+
+    fn run_long_trial(hold_ms: u64) -> (bool, bool) {
+        let mut g = gate();
+        let _ = see(&mut g, 0, Some(open_palm(0.0, 0.0)));
+        let _ = see(&mut g, 10, Some(fist_at(0.0, 0.0)));
+        // Still closed at long threshold → pressed; then release.
+        let armed = see(&mut g, 10 + hold_ms, Some(fist_at(0.01, 0.01)));
+        let released = see(&mut g, 10 + hold_ms + 50, Some(open_palm(0.0, 0.0)));
+        let got_click = armed
+            .iter()
+            .chain(released.iter())
+            .any(|d| matches!(d, Decision::Click));
+        let got_dictation = armed
+            .iter()
+            .any(|d| matches!(d, Decision::DictationPressed));
+        (got_click, got_dictation)
+    }
+
+    /// Drive N short/long sequences through [`GestureGate`] and collect mistakes.
+    fn g07_batch(n: usize) -> (usize, Vec<usize>, Vec<G07Trial>) {
+        assert!(n >= 2 && n % 2 == 0, "G-07 batch expects even N≥2");
+        let short_holds: [u64; 10] = [50, 100, 150, 200, 250, 300, 350, 380, 390, 399];
+        let long_holds: [u64; 10] = [
+            PROVISIONAL_LONG_FIST_MIN_MS,
+            PROVISIONAL_LONG_FIST_MIN_MS + 20,
+            PROVISIONAL_LONG_FIST_MIN_MS + 40,
+            PROVISIONAL_LONG_FIST_MIN_MS + 80,
+            PROVISIONAL_LONG_FIST_MIN_MS + 120,
+            PROVISIONAL_LONG_FIST_MIN_MS + 160,
+            PROVISIONAL_LONG_FIST_MIN_MS + 200,
+            PROVISIONAL_LONG_FIST_MIN_MS + 250,
+            PROVISIONAL_LONG_FIST_MIN_MS + 300,
+            PROVISIONAL_LONG_FIST_MIN_MS + 400,
+        ];
+        let mut trials = Vec::with_capacity(n);
+        let mut fail_idx = Vec::new();
+        for i in 0..n {
+            let (kind, hold_ms) = if i % 2 == 0 {
+                (G07Kind::Short, short_holds[(i / 2) % short_holds.len()])
+            } else {
+                (G07Kind::Long, long_holds[(i / 2) % long_holds.len()])
+            };
+            let (got_click, got_dictation) = match kind {
+                G07Kind::Short => run_short_trial(hold_ms),
+                G07Kind::Long => run_long_trial(hold_ms),
+            };
+            let wrong = match kind {
+                // Short must click and must not start dictation.
+                G07Kind::Short => !got_click || got_dictation,
+                // Long must press dictation and must not click.
+                G07Kind::Long => !got_dictation || got_click,
+            };
+            if wrong {
+                fail_idx.push(i);
+            }
+            trials.push(G07Trial {
+                index: i,
+                kind,
+                hold_ms,
+                got_click,
+                got_dictation_pressed: got_dictation,
+                wrong,
+            });
+        }
+        (fail_idx.len(), fail_idx, trials)
+    }
+
+    #[test]
+    fn g07_short_vs_long_batch_n20_wrong_at_most_one() {
+        const N: usize = 20;
+        const MAX_WRONG: usize = 1;
+        let (wrong, fail_idx, trials) = g07_batch(N);
+        let short_ok = trials
+            .iter()
+            .filter(|t| t.kind == G07Kind::Short && !t.wrong)
+            .count();
+        let long_ok = trials
+            .iter()
+            .filter(|t| t.kind == G07Kind::Long && !t.wrong)
+            .count();
+        assert!(
+            wrong <= MAX_WRONG,
+            "G-07 batch failed: wrong={wrong} (max {MAX_WRONG}); fail_indices={fail_idx:?}; short_ok={short_ok}/10 long_ok={long_ok}/10; trials={trials:?}"
+        );
+        // Sanity: both kinds exercised.
+        assert_eq!(trials.iter().filter(|t| t.kind == G07Kind::Short).count(), 10);
+        assert_eq!(trials.iter().filter(|t| t.kind == G07Kind::Long).count(), 10);
+        assert!(
+            trials.iter().all(|t| t.hold_ms < PROVISIONAL_SHORT_FIST_MAX_MS
+                || t.hold_ms >= PROVISIONAL_LONG_FIST_MIN_MS),
+            "holds must stay in short or long band (provisional)"
+        );
+    }
+
+    /// G-09 gate layer: while OpenLess owns insertion/recording (`external_busy`),
+    /// open-palm follow and short-fist click must not fire (禁点禁移); scroll stays 0.
+    #[test]
+    fn g09_external_busy_blocks_move_and_click() {
+        let mut g = gate();
+        // Wave: no move while busy.
+        let waved = g.push(
+            HandObservation::with_landmarks(0, open_palm(0.0, 0.0), 0.95),
+            true,
+        );
+        assert!(waved.is_empty());
+        assert_eq!(g.snapshot().gate_state, TrayState::Recording);
+        assert_eq!(g.snapshot().session_counts.move_count, 0);
+        assert_eq!(g.snapshot().session_counts.click, 0);
+        assert_eq!(g.snapshot().session_counts.scroll, 0);
+
+        // Short fist attempt while still busy: still no click / dictation.
+        let fist = g.push(
+            HandObservation::with_landmarks(20, fist_at(0.0, 0.0), 0.95),
+            true,
+        );
+        assert!(fist.is_empty());
+        let release = g.push(
+            HandObservation::with_landmarks(20 + 200, open_palm(0.1, 0.0), 0.95),
+            true,
+        );
+        assert!(release.is_empty());
+        let snap = g.snapshot();
+        assert_eq!(snap.session_counts.click, 0);
+        assert_eq!(snap.session_counts.move_count, 0);
+        assert_eq!(snap.session_counts.scroll, 0);
+        assert_eq!(snap.session_counts.dictation_pressed, 0);
+        assert_eq!(snap.last_decision, DecisionKind::None);
+
+        // Busy cleared → follow resumes (not asserting product pass for host insert).
+        let resumed = see(&mut g, 300, Some(open_palm(0.0, 0.0)));
+        assert!(resumed.iter().any(|d| matches!(d, Decision::Move { .. })));
+    }
+
 }

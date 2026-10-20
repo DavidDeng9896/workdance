@@ -71,4 +71,36 @@ mod tests {
         assert_eq!(max_depth.load(Ordering::SeqCst), 1);
         assert!(!io_lock_held());
     }
+
+    /// G-09 co-lock: a held IoGuard (text insert) excludes a concurrent pointer click slot.
+    #[test]
+    fn g09_io_guard_excludes_concurrent_pointer_slot() {
+        let insert_entered = AtomicUsize::new(0);
+        let click_entered = AtomicUsize::new(0);
+        let overlap = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let _guard = IoGuard::enter();
+                insert_entered.store(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(40));
+                // Still holding: click thread must not have entered yet.
+                if click_entered.load(Ordering::SeqCst) != 0 {
+                    overlap.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            scope.spawn(|| {
+                while insert_entered.load(Ordering::SeqCst) == 0 {
+                    thread::yield_now();
+                }
+                with_io_serial(|| {
+                    click_entered.store(1, Ordering::SeqCst);
+                    // Insert guard must already be gone (Drop) before we enter.
+                    thread::sleep(Duration::from_millis(5));
+                });
+            });
+        });
+        assert_eq!(overlap.load(Ordering::SeqCst), 0);
+        assert_eq!(click_entered.load(Ordering::SeqCst), 1);
+        assert!(!io_lock_held());
+    }
 }
