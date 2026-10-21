@@ -58,6 +58,10 @@ fn build_experimental_gemma() {
             "OpenlessGemma",
             "-target",
             "arm64-apple-macosx14.0",
+            "-framework",
+            "Accelerate",
+            "-framework",
+            "CoreML",
             SOURCE,
             "-o",
         ])

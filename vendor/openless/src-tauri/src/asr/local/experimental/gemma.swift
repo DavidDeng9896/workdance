@@ -180,11 +180,10 @@ private final class GemmaRecognizer {
         return text
     }
     func transcribe(_ samples: [Float], checkpoint: () throws -> Void) throws -> String {
-        // Limit only this caller's CPU BLAS work, never the whole app. Core ML
-        // remains .all so supported GPU/ANE partitions are still available.
-        let threading = BLASGetThreading()
-        BLASSetThreading(BLAS_THREADING_SINGLE_THREADED)
-        defer { BLASSetThreading(threading) }
+        // BLASGetThreading / BLASSetThreading / BLAS_THREADING_SINGLE_THREADED
+        // are unavailable on the public Accelerate headers used by macOS 14
+        // CI (swiftc reports them missing even with -framework Accelerate).
+        // Skip the per-caller BLAS pin; Core ML still runs with .all.
         try checkpoint()
         guard !samples.isEmpty else { return "" }
         // Short-silence guard prevents turning empty recordings into words.
