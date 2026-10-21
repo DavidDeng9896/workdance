@@ -1,0 +1,43 @@
+name: mac-dmg
+on:
+  workflow_dispatch:
+  push:
+    branches: [cursor/openless-gesture-host-97b3]
+permissions:
+  contents: write
+jobs:
+  dmg:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-apple-darwin }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "vendor/openless/src-tauri -> target" }
+      - name: npm ci
+        working-directory: vendor/openless
+        run: npm ci
+      - name: tauri build (unsigned, ad-hoc)
+        working-directory: vendor/openless
+        env: { APPLE_SIGNING_IDENTITY: "-" }
+        run: npx tauri build --bundles dmg
+      - name: fetch hand_landmarker.task
+        run: |
+          curl -fsSL -o hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+          echo "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1  hand_landmarker.task" | shasum -a 256 -c
+      - id: f
+        run: |
+          D=$(find . -path '*bundle/dmg/*.dmg' -not -path './node_modules/*' | head -1)
+          echo "dmg=$D" >> $GITHUB_OUTPUT; ls -la "$D"
+      - uses: actions/upload-artifact@v4
+        with: { name: openless-mac-dmg, path: "${{ steps.f.outputs.dmg }}" }
+      - name: prerelease
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          T=wd-mac-${GITHUB_SHA::7}
+          cp "${{ steps.f.outputs.dmg }}" OpenLess-WorkDance-arm64.dmg
+          gh release create "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --prerelease --target "$GITHUB_SHA" \
+            --title "WorkDance OpenLess mac $T" --notes "Unsigned arm64 build. Open: xattr -cr /Applications/OpenLess.app (or right-click > Open). Gesture: see SELFTEST.md / README-mac-dmg (MEDIAPIPE_LIB + WORKDANCE_HAND_MODEL)." \
+          || gh release upload "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --clobber

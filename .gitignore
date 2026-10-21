@@ -13,5 +13,8 @@ vendor/openless/src-tauri/gen
 .vscode
 # Model blobs (download via scripts/; never commit)
 **/models/**
+# Exception: OpenLess settings UI (was wrongly excluded by **/models/**)
+!vendor/openless/src/pages/settings/models/
+!vendor/openless/src/pages/settings/models/**
 *.task
 *.onnx
