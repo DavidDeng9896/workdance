@@ -45,28 +45,21 @@ jobs:
       - name: tauri build (unsigned, ad-hoc)
         working-directory: vendor/openless
         env: { APPLE_SIGNING_IDENTITY: "-" }
-        run: npx tauri build --bundles dmg
-      - name: verify gesture deps inside .app
-        run: |
-          APP=$(find vendor/openless/src-tauri/target -path '*bundle/macos/*.app' -maxdepth 5 | head -1)
-          echo "app=$APP"
-          test -f "$APP/Contents/Frameworks/libmediapipe.dylib"
-          test -f "$APP/Contents/Resources/models/hand_landmarker.task"
-          ls -la "$APP/Contents/Frameworks" "$APP/Contents/Resources/models"
-          otool -L "$APP/Contents/Frameworks/libmediapipe.dylib" | head
-          nm -gU "$APP/Contents/Frameworks/libmediapipe.dylib" | grep -q _MpHandLandmarkerCreate
-          cp vendor/openless/src-tauri/mac-deps/hand_landmarker.task hand_landmarker.task
+        run: npx tauri build --bundles app
       - id: f
+        name: finalize .app (vendor deps, @rpath id, ad-hoc sign, verify) + build dmg from signed app
         run: |
-          D=$(find . -path '*bundle/dmg/*.dmg' -not -path './node_modules/*' | head -1)
-          echo "dmg=$D" >> $GITHUB_OUTPUT; ls -la "$D"
+          APP=$(find vendor/openless/src-tauri/target -maxdepth 5 -path '*bundle/macos/*.app' | head -1)
+          test -n "$APP"
+          bash scripts/mac-finalize-app.sh "$APP" "$PWD/OpenLess-WorkDance-arm64.dmg"
+          cp vendor/openless/src-tauri/mac-deps/hand_landmarker.task hand_landmarker.task
+          echo "dmg=$PWD/OpenLess-WorkDance-arm64.dmg" >> $GITHUB_OUTPUT
       - uses: actions/upload-artifact@v4
         with: { name: openless-mac-dmg, path: "${{ steps.f.outputs.dmg }}" }
       - name: prerelease
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           T=wd-mac-${GITHUB_SHA::7}
-          cp "${{ steps.f.outputs.dmg }}" OpenLess-WorkDance-arm64.dmg
           gh release create "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --prerelease --target "$GITHUB_SHA" \
             --title "WorkDance OpenLess mac $T" --notes "Unsigned arm64 build. Open: xattr -cr /Applications/OpenLess.app (or right-click > Open). Gesture: see SELFTEST.md / README-mac-dmg (MEDIAPIPE_LIB + WORKDANCE_HAND_MODEL)." \
           || gh release upload "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --clobber
