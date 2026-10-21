@@ -1,6 +1,11 @@
 name: mac-dmg
 on:
   workflow_dispatch:
+    inputs:
+      mediapipe_from_source:
+        description: "Build libmediapipe.dylib with bazel from google-ai-edge/mediapipe v0.10.35 instead of the official wheel prebuilt"
+        type: boolean
+        default: false
   push:
     branches: [cursor/openless-gesture-host-97b3]
 permissions:
@@ -16,6 +21,24 @@ jobs:
         with: { node-version: 22 }
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: "vendor/openless/src-tauri -> target" }
+      - name: bazel cache
+        if: ${{ inputs.mediapipe_from_source }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-mediapipe-v0.10.35-macos14-arm64
+      - name: build libmediapipe.dylib from source (optional, ~60-90 min cold)
+        if: ${{ inputs.mediapipe_from_source }}
+        run: |
+          git clone --depth 1 -b v0.10.35 https://github.com/google-ai-edge/mediapipe.git /tmp/mp
+          cd /tmp/mp
+          brew install bazelisk || true
+          bazelisk build --config darwin_arm64 -c opt --strip always --define MEDIAPIPE_DISABLE_GPU=1 //mediapipe/tasks/c:mediapipe_macos
+          mkdir -p $GITHUB_WORKSPACE/vendor/openless/src-tauri/mac-deps
+          cp -f bazel-bin/mediapipe/tasks/c/libmediapipe.dylib $GITHUB_WORKSPACE/vendor/openless/src-tauri/mac-deps/
+          chmod u+w $GITHUB_WORKSPACE/vendor/openless/src-tauri/mac-deps/libmediapipe.dylib
+      - name: fetch mediapipe dylib + hand model (sha256-pinned)
+        run: bash scripts/fetch-mac-bundle-deps.sh
       - name: npm ci
         working-directory: vendor/openless
         run: npm ci
@@ -23,10 +46,16 @@ jobs:
         working-directory: vendor/openless
         env: { APPLE_SIGNING_IDENTITY: "-" }
         run: npx tauri build --bundles dmg
-      - name: fetch hand_landmarker.task
+      - name: verify gesture deps inside .app
         run: |
-          curl -fsSL -o hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
-          echo "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1  hand_landmarker.task" | shasum -a 256 -c
+          APP=$(find vendor/openless/src-tauri/target -path '*bundle/macos/*.app' -maxdepth 5 | head -1)
+          echo "app=$APP"
+          test -f "$APP/Contents/Frameworks/libmediapipe.dylib"
+          test -f "$APP/Contents/Resources/models/hand_landmarker.task"
+          ls -la "$APP/Contents/Frameworks" "$APP/Contents/Resources/models"
+          otool -L "$APP/Contents/Frameworks/libmediapipe.dylib" | head
+          nm -gU "$APP/Contents/Frameworks/libmediapipe.dylib" | grep -q _MpHandLandmarkerCreate
+          cp vendor/openless/src-tauri/mac-deps/hand_landmarker.task hand_landmarker.task
       - id: f
         run: |
           D=$(find . -path '*bundle/dmg/*.dmg' -not -path './node_modules/*' | head -1)

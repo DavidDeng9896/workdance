@@ -20,22 +20,61 @@ pub const HAND_LANDMARKER_URL: &str =
 pub const HAND_LANDMARKER_SHA256: &str =
     "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1";
 
-pub fn default_hand_model_path() -> PathBuf {
-    if let Ok(p) = std::env::var("WORKDANCE_HAND_MODEL") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
+/// Directory of the running executable (`.app/Contents/MacOS` on macOS).
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Bundle-relative model locations (Tauri resource dir = `Contents/Resources`).
+fn bundle_model_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    let res = exe_dir.join("..").join("Resources");
+    vec![
+        res.join("models").join("hand_landmarker.task"),
+        res.join("hand_landmarker.task"),
+        exe_dir.join("models").join("hand_landmarker.task"),
+    ]
+}
+
+/// Lookup order: `WORKDANCE_HAND_MODEL` → `WORKDANCE_MODEL_DIR` → bundled
+/// resource (first that exists) → per-user data dir. Explicit env wins even
+/// when missing so a wrong override fails loudly in `open`.
+fn resolve_model_path(
+    env_model: Option<String>,
+    env_dir: Option<String>,
+    exe_dir: Option<&Path>,
+    data_local: Option<PathBuf>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(p) = env_model {
+        return PathBuf::from(p);
+    }
+    if let Some(dir) = env_dir {
+        return PathBuf::from(dir).join("hand_landmarker.task");
+    }
+    if let Some(dir) = exe_dir {
+        if let Some(hit) = bundle_model_candidates(dir).into_iter().find(|p| exists(p)) {
+            return hit;
         }
     }
-    if let Ok(dir) = std::env::var("WORKDANCE_MODEL_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir).join("hand_landmarker.task");
-        }
-    }
-    dirs::data_local_dir()
+    data_local
         .unwrap_or_else(|| PathBuf::from("."))
         .join("workdance")
         .join("models")
         .join("hand_landmarker.task")
+}
+
+pub fn default_hand_model_path() -> PathBuf {
+    resolve_model_path(
+        non_empty_env("WORKDANCE_HAND_MODEL"),
+        non_empty_env("WORKDANCE_MODEL_DIR"),
+        exe_dir().as_deref(),
+        dirs::data_local_dir(),
+        &|p: &Path| p.is_file(),
+    )
 }
 
 #[repr(C)]
@@ -196,21 +235,34 @@ impl MpApi {
     }
 }
 
-fn candidate_lib_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(p) = std::env::var("MEDIAPIPE_LIB") {
-        if !p.trim().is_empty() {
-            out.push(PathBuf::from(p));
-        }
+fn lib_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "mediapipe.dll"
+    } else if cfg!(target_os = "macos") {
+        "libmediapipe.dylib"
+    } else {
+        "libmediapipe.so"
     }
-    if let Some(cache) = dirs::cache_dir() {
-        let name = if cfg!(target_os = "windows") {
-            "mediapipe.dll"
-        } else if cfg!(target_os = "macos") {
-            "libmediapipe.dylib"
-        } else {
-            "libmediapipe.so"
-        };
+}
+
+/// Order: `MEDIAPIPE_LIB` → `<exe>/../Frameworks` → `<exe>/../Resources` →
+/// `<exe>/` → cache dirs → system paths.
+fn lib_candidates_from(
+    env_lib: Option<String>,
+    exe_dir: Option<&Path>,
+    cache: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let name = lib_file_name();
+    let mut out = Vec::new();
+    if let Some(p) = env_lib {
+        out.push(PathBuf::from(p));
+    }
+    if let Some(dir) = exe_dir {
+        out.push(dir.join("..").join("Frameworks").join(name));
+        out.push(dir.join("..").join("Resources").join(name));
+        out.push(dir.join(name));
+    }
+    if let Some(cache) = cache {
         out.push(cache.join("mediapipe-rs").join("0.10.35").join(name));
         out.push(cache.join("mediapipe-rs").join(name));
         out.push(cache.join("mediapipe").join(name));
@@ -227,6 +279,10 @@ fn candidate_lib_paths() -> Vec<PathBuf> {
     out
 }
 
+fn candidate_lib_paths() -> Vec<PathBuf> {
+    lib_candidates_from(non_empty_env("MEDIAPIPE_LIB"), exe_dir().as_deref(), dirs::cache_dir())
+}
+
 fn load_api() -> Result<Arc<MpApi>, String> {
     let mut errors = Vec::new();
     for path in candidate_lib_paths() {
@@ -238,8 +294,13 @@ fn load_api() -> Result<Arc<MpApi>, String> {
             Err(e) => errors.push(format!("{}: {e}", path.display())),
         }
     }
+    let tried: Vec<String> = candidate_lib_paths()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     Err(format!(
-        "libmediapipe not found (set MEDIAPIPE_LIB). {}",
+        "libmediapipe not found (set MEDIAPIPE_LIB). Tried: {}. {}",
+        tried.join(", "),
         errors.join("; ")
     ))
 }
@@ -435,7 +496,7 @@ mod tests {
 
     #[test]
     fn missing_model_is_explicit() {
-        let err = MediaPipeHands::open(Path::new("/no/such/hand_landmarker.task")).unwrap_err();
+        let err = match MediaPipeHands::open(Path::new("/no/such/hand_landmarker.task")) { Err(e) => e, Ok(_) => panic!("expected error") };
         assert!(err.contains("missing"), "{err}");
     }
 
@@ -443,5 +504,53 @@ mod tests {
     fn pinned_model_constants() {
         assert!(HAND_LANDMARKER_URL.contains("hand_landmarker.task"));
         assert_eq!(HAND_LANDMARKER_SHA256.len(), 64);
+    }
+
+    #[test]
+    fn lib_lookup_order_env_then_bundle_then_cache() {
+        let exe = Path::new("/A.app/Contents/MacOS");
+        let v = lib_candidates_from(
+            Some("/env/libmp".into()),
+            Some(exe),
+            Some(PathBuf::from("/cache")),
+        );
+        let n = lib_file_name();
+        assert_eq!(v[0], PathBuf::from("/env/libmp"));
+        assert_eq!(v[1], exe.join("..").join("Frameworks").join(n));
+        assert_eq!(v[2], exe.join("..").join("Resources").join(n));
+        assert_eq!(v[3], exe.join(n));
+        assert_eq!(v[4], PathBuf::from("/cache/mediapipe-rs/0.10.35").join(n));
+    }
+
+    #[test]
+    fn lib_lookup_without_env_starts_at_frameworks() {
+        let exe = Path::new("/A.app/Contents/MacOS");
+        let v = lib_candidates_from(None, Some(exe), None);
+        assert_eq!(v[0], exe.join("..").join("Frameworks").join(lib_file_name()));
+    }
+
+    #[test]
+    fn model_env_override_wins_even_if_bundle_exists() {
+        let exe = Path::new("/A.app/Contents/MacOS");
+        let p = resolve_model_path(Some("/x.task".into()), None, Some(exe), None, &|_| true);
+        assert_eq!(p, PathBuf::from("/x.task"));
+        let p = resolve_model_path(None, Some("/d".into()), Some(exe), None, &|_| true);
+        assert_eq!(p, PathBuf::from("/d/hand_landmarker.task"));
+    }
+
+    #[test]
+    fn model_bundle_resource_before_data_dir() {
+        let exe = Path::new("/A.app/Contents/MacOS");
+        let want = exe.join("..").join("Resources").join("models").join("hand_landmarker.task");
+        let w = want.clone();
+        let p = resolve_model_path(None, None, Some(exe), Some("/data".into()), &move |q| q == w);
+        assert_eq!(p, want);
+    }
+
+    #[test]
+    fn model_falls_back_to_data_dir_when_bundle_missing() {
+        let exe = Path::new("/A.app/Contents/MacOS");
+        let p = resolve_model_path(None, None, Some(exe), Some("/data".into()), &|_| false);
+        assert_eq!(p, PathBuf::from("/data/workdance/models/hand_landmarker.task"));
     }
 }

@@ -269,7 +269,8 @@ fn current_screen(app: &AppHandle, mirror_x: bool) -> Screen {
 
 fn publish(shared: &Shared, camera_open: bool) {
     let snapshot = shared.gate.lock().snapshot();
-    let tray = snapshot.gate_state;
+    let tracker_error = shared.status.lock().tracker_error.clone();
+    let tray = TrayState::effective(snapshot.gate_state, tracker_error.as_deref());
     let tooltip = tray.tooltip();
     {
         let mut status = shared.status.lock();

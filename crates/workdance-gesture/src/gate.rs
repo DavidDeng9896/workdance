@@ -24,15 +24,27 @@ pub enum TrayState {
     Tracking,
     Recording,
     RejectCooldown,
+    /// MediaPipe lib or hand model missing / failed to load. Never shown as Idle.
+    NotInstalled,
 }
 
 impl TrayState {
+    /// Tray state to display: a tracker load error overrides the gate state.
+    pub fn effective(gate_state: TrayState, tracker_error: Option<&str>) -> TrayState {
+        if tracker_error.is_some() {
+            TrayState::NotInstalled
+        } else {
+            gate_state
+        }
+    }
+
     pub fn label_zh(self) -> &'static str {
         match self {
             Self::Idle => "安静",
             Self::Tracking => "正在听手",
             Self::Recording => "正在录音",
             Self::RejectCooldown => "刚误触停一下",
+            Self::NotInstalled => "手势没装好",
         }
     }
 
@@ -42,6 +54,7 @@ impl TrayState {
             Self::Tracking => "Tracking",
             Self::Recording => "Recording",
             Self::RejectCooldown => "Reject cooldown",
+            Self::NotInstalled => "Gesture not installed",
         }
     }
 
@@ -753,4 +766,13 @@ mod tests {
         assert!(resumed.iter().any(|d| matches!(d, Decision::Move { .. })));
     }
 
+
+    #[test]
+    fn missing_tracker_shows_not_installed_not_idle() {
+        let t = TrayState::effective(TrayState::Idle, Some("libmediapipe not found"));
+        assert_eq!(t, TrayState::NotInstalled);
+        assert_eq!(t.label_zh(), "手势没装好");
+        assert_ne!(t.label_zh(), TrayState::Idle.label_zh());
+        assert_eq!(TrayState::effective(TrayState::Idle, None), TrayState::Idle);
+    }
 }

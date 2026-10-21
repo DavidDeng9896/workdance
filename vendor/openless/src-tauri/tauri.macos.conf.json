@@ -20,7 +20,13 @@
           "x": 552,
           "y": 253
         }
-      }
+      },
+      "frameworks": [
+        "mac-deps/libmediapipe.dylib"
+      ]
+    },
+    "resources": {
+      "mac-deps/hand_landmarker.task": "models/hand_landmarker.task"
     }
   }
 }

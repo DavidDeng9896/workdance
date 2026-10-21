@@ -18,3 +18,5 @@ vendor/openless/src-tauri/gen
 !vendor/openless/src/pages/settings/models/**
 *.task
 *.onnx
+# mac bundle deps fetched by scripts/fetch-mac-bundle-deps.sh
+vendor/openless/src-tauri/mac-deps/
