@@ -61,5 +61,5 @@ jobs:
         run: |
           T=wd-mac-${GITHUB_SHA::7}
           gh release create "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --prerelease --target "$GITHUB_SHA" \
-            --title "WorkDance OpenLess mac $T" --notes "Unsigned arm64 build. Open: xattr -cr /Applications/OpenLess.app (or right-click > Open). Gesture: see SELFTEST.md / README-mac-dmg (MEDIAPIPE_LIB + WORKDANCE_HAND_MODEL)." \
+            --title "WorkDance OpenLess mac $T" --notes "Unsigned arm64 build with MediaPipe + hand model in the app. Open: xattr -cr /Applications/OpenLess.app (or right-click > Open). Do not set MEDIAPIPE_LIB; the app loads Contents/Frameworks. See docs/README-mac-dmg.md." \
           || gh release upload "$T" OpenLess-WorkDance-arm64.dmg hand_landmarker.task --clobber

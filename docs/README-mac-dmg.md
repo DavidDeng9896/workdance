@@ -1,14 +1,15 @@
 # macOS .dmg (CI, unsigned)
-Built by `.github/workflows/mac-dmg.yml` on macos-14 arm64, attached to prerelease `wd-mac-<sha>`.
-- Open unsigned app: drag to /Applications, then `xattr -cr /Applications/OpenLess.app` (or right-click > Open).
-- MediaPipe is NOT bundled (no public prebuilt libmediapipe). Gesture needs:
-  - `hand_landmarker.task` (release asset) at `~/Library/Application Support/workdance/models/hand_landmarker.task`, or `WORKDANCE_HAND_MODEL=/path/hand_landmarker.task`
-  - `MEDIAPIPE_LIB=/path/libmediapipe.dylib`
-  Without these the app runs; gesture falls back/disabled.
 
-## Gesture-capable build (commit after the first no-gesture build)
-- `scripts/fetch-mac-bundle-deps.sh` puts `libmediapipe.dylib` (official MediaPipe 0.10.35, from Google's PyPI wheel `mediapipe-0.10.35-py3-none-macosx_11_0_arm64.whl`, sha256-pinned) and `hand_landmarker.task` into `vendor/openless/src-tauri/mac-deps/`. Run it before a local mac `tauri build`. `tauri.macos.conf.json` requires these files.
-- Bundle layout: `Contents/Frameworks/libmediapipe.dylib` and `Contents/Resources/models/hand_landmarker.task`.
-- Lookup at runtime: lib `MEDIAPIPE_LIB` → `<exe>/../Frameworks` → `<exe>/../Resources` → cache/system; model `WORKDANCE_HAND_MODEL` → `WORKDANCE_MODEL_DIR` → bundle Resources → `~/Library/Application Support/workdance/models`.
-- If either is missing the tray shows 「手势没装好」, not 「安静」.
-- CI fallback: run workflow_dispatch with `mediapipe_from_source=true` to build the dylib with bazel from v0.10.35.
+Built by `.github/workflows/mac-dmg.yml` on macos-14 arm64, attached to prerelease `wd-mac-<sha>`.
+
+## Install
+Drag to `/Applications`, then `xattr -cr /Applications/OpenLess.app` (or right-click → Open). No env vars needed for the gesture-capable builds (`f98de30` and later).
+
+## What's inside (gesture-capable)
+- `Contents/Frameworks/libmediapipe.dylib` (MediaPipe 0.10.35 C API, from Google's official arm64 wheel)
+- `Contents/Resources/models/hand_landmarker.task`
+
+Do **not** set `MEDIAPIPE_LIB` / `WORKDANCE_HAND_MODEL` for a normal install — those are optional overrides for developers. The app looks in the bundle first (after any explicit override). If the lib or model is missing, the tray shows 「手势没装好」, not 「安静」.
+
+## Local rebuild
+Run `scripts/fetch-mac-bundle-deps.sh` before `npx tauri build` on a Mac. Optional CI `workflow_dispatch` input `mediapipe_from_source=true` builds the dylib with bazel from v0.10.35 instead of the wheel.
