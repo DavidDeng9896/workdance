@@ -7,7 +7,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [cursor/openless-gesture-host-97b3]
+    branches: [cursor/openless-gesture-host-97b3, main]
 permissions:
   contents: write
 jobs:
@@ -49,7 +49,7 @@ jobs:
       - id: f
         name: finalize .app (vendor deps, @rpath id, ad-hoc sign, verify) + build dmg from signed app
         run: |
-          APP=$(find vendor/openless/src-tauri/target -maxdepth 5 -path '*bundle/macos/*.app' | head -1)
+          APP=$(find vendor/openless/src-tauri/target -path '*/bundle/macos/*.app' | head -1)
           test -n "$APP"
           bash scripts/mac-finalize-app.sh "$APP" "$PWD/OpenLess-WorkDance-arm64.dmg"
           cp vendor/openless/src-tauri/mac-deps/hand_landmarker.task hand_landmarker.task

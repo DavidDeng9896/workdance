@@ -43,7 +43,16 @@ done
 id=$(otool -D "$LIB" | tail -n +2)
 [[ "$id" == "@rpath/libmediapipe.dylib" ]] || { echo "FAIL: id=$id" >&2; exit 1; }
 # Gate: symbols + arch.
-nm -gU "$LIB" | grep -q _MpHandLandmarkerCreate || { echo "FAIL: no _MpHandLandmarkerCreate" >&2; exit 1; }
+# Write nm to a file first: `nm | grep -q` under pipefail exits 141 (SIGPIPE) on a hit.
+nm -gU "$LIB" > /tmp/mp-nm.txt 2>/tmp/mp-nm.err || true
+if ! grep -F _MpHandLandmarkerCreate /tmp/mp-nm.txt >/dev/null; then
+  # Stripped / hidden visibility: fall back to strings.
+  if ! strings -a "$LIB" | grep -F _MpHandLandmarkerCreate >/dev/null; then
+    echo "FAIL: no _MpHandLandmarkerCreate" >&2
+    head -20 /tmp/mp-nm.err >&2 || true
+    exit 1
+  fi
+fi
 for f in "$LIB" "$APP/Contents/MacOS/"*; do
   a=$(lipo -archs "$f"); echo "lipo $f: $a"
   [[ " $a " == *" arm64 "* ]] || { echo "FAIL: $f not arm64" >&2; exit 1; }
