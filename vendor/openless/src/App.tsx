@@ -35,6 +35,9 @@ const Onboarding = lazy(() =>
   import('./components/Onboarding').then((m) => ({ default: m.Onboarding })),
 );
 const QaPanel = lazy(() => import('./pages/QaPanel').then((m) => ({ default: m.QaPanel })));
+const WorkdancePip = lazy(() =>
+  import('./pages/WorkdancePip').then((m) => ({ default: m.WorkdancePip })),
+);
 const SelectionVoiceIntentPicker = lazy(() =>
   import('./pages/SelectionVoiceIntentPicker').then((m) => ({
     default: m.SelectionVoiceIntentPicker,
