@@ -27,6 +27,7 @@ const isSelectionVoiceIntent = windowKind === 'selection-voice-intent';
 const isVoiceEdit = windowKind === 'voice-edit';
 const isLessComputer = windowKind === 'less-computer';
 const isLessComputerGlow = windowKind === 'less-computer-glow';
+const isWorkdancePip = windowKind === 'workdance-pip';
 // Auxiliary windows share the bundle but never run main-window startup work.
 const isMainWindow = !windowKind;
 const osQuery = params.get('os') as OS | null;
@@ -52,6 +53,7 @@ const renderApp = () => {
           isVoiceEdit={isVoiceEdit}
           isLessComputer={isLessComputer}
           isLessComputerGlow={isLessComputerGlow}
+          isWorkdancePip={isWorkdancePip}
           forcedOs={os}
         />
       </TooltipProvider>

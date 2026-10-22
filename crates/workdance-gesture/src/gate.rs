@@ -26,13 +26,21 @@ pub enum TrayState {
     RejectCooldown,
     /// MediaPipe lib or hand model missing / failed to load. Never shown as Idle.
     NotInstalled,
+    /// macOS Accessibility (or equivalent) denied — pointer inject cannot work.
+    NeedsAccessibility,
 }
 
 impl TrayState {
-    /// Tray state to display: a tracker load error overrides the gate state.
-    pub fn effective(gate_state: TrayState, tracker_error: Option<&str>) -> TrayState {
+    /// Tray state to display: tracker load error and accessibility denial override the gate.
+    pub fn effective(
+        gate_state: TrayState,
+        tracker_error: Option<&str>,
+        accessibility_denied: bool,
+    ) -> TrayState {
         if tracker_error.is_some() {
             TrayState::NotInstalled
+        } else if accessibility_denied {
+            TrayState::NeedsAccessibility
         } else {
             gate_state
         }
@@ -45,6 +53,7 @@ impl TrayState {
             Self::Recording => "正在录音",
             Self::RejectCooldown => "刚误触停一下",
             Self::NotInstalled => "手势没装好",
+            Self::NeedsAccessibility => "需要辅助功能",
         }
     }
 
@@ -55,6 +64,7 @@ impl TrayState {
             Self::Recording => "Recording",
             Self::RejectCooldown => "Reject cooldown",
             Self::NotInstalled => "Gesture not installed",
+            Self::NeedsAccessibility => "Needs Accessibility",
         }
     }
 
@@ -769,10 +779,20 @@ mod tests {
 
     #[test]
     fn missing_tracker_shows_not_installed_not_idle() {
-        let t = TrayState::effective(TrayState::Idle, Some("libmediapipe not found"));
+        let t = TrayState::effective(TrayState::Idle, Some("libmediapipe not found"), false);
         assert_eq!(t, TrayState::NotInstalled);
         assert_eq!(t.label_zh(), "手势没装好");
         assert_ne!(t.label_zh(), TrayState::Idle.label_zh());
-        assert_eq!(TrayState::effective(TrayState::Idle, None), TrayState::Idle);
+        assert_eq!(TrayState::effective(TrayState::Idle, None, false), TrayState::Idle);
+    }
+
+    #[test]
+    fn accessibility_denied_shows_needs_accessibility() {
+        let t = TrayState::effective(TrayState::Tracking, None, true);
+        assert_eq!(t, TrayState::NeedsAccessibility);
+        assert_eq!(t.label_zh(), "需要辅助功能");
+        // Tracker error still wins over accessibility.
+        let t2 = TrayState::effective(TrayState::Tracking, Some("no camera"), true);
+        assert_eq!(t2, TrayState::NotInstalled);
     }
 }

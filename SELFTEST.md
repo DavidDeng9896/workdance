@@ -16,6 +16,8 @@ Windows and macOS verify the shell with the command below.
 | `TextInserter::insert` (and clipboard restore / unicode keystrokes / `copy_fallback`) | `workdance_gesture::IoGuard` so pointer injection cannot overlap an insert |
 | Tray id `main-tray` | Tooltip `WorkDance · 安静 / Idle` (正在听手 / 正在录音 / 刚误触停一下) |
 | Capsule event channel | `workdance:tray` listened to by `Capsule.tsx` when the capsule is idle |
+| Continuity PiP | Always-on-top `workdance-pip` (180×120, bottom-right): mirrored camera + blue 21-point skeleton + corner hand count; listens to `workdance:hand` |
+| Accessibility denied | Tray / PiP show `需要辅助功能` (never silent Enigo failure) |
 
 ASR is still OpenLess: local sherpa/foundry **and** the existing cloud/API providers. Gesture code does not pick a provider.
 

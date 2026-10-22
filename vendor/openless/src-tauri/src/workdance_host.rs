@@ -2,6 +2,7 @@
 //!
 //! Pointer injection and text insertion share [`workdance_gesture::with_io_serial`].
 //! Keyboard hotkeys stay on the existing OpenLess monitors.
+//! Continuity PiP (`workdance-pip`) shows camera + blue 21-point skeleton.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,13 +11,19 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use workdance_gesture::{
     apply_decision, default_hand_model_path, ApplyOutcome, CameraCapture, Decision, DictationEdges,
-    EdgeSession, GateSnapshot, GestureGate, HandObservation, MediaPipeHands, PointerInject, Screen,
-    TrayState,
+    EdgeSession, GateSnapshot, GestureGate, HandObservation, Landmark, MediaPipeHands,
+    PointerInject, Screen, TrayState, HAND_LANDMARKS,
 };
+
+const PIP_LABEL: &str = "workdance-pip";
+const PIP_W: f64 = 180.0;
+const PIP_H: f64 = 120.0;
+const LANDMARK_SMOOTH: f32 = 0.4;
+const CURSOR_SMOOTH: f32 = 0.45;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +32,7 @@ pub struct WorkdanceStatus {
     pub camera_open: bool,
     pub tracker_error: Option<String>,
     pub front_camera_mirror_x: bool,
+    pub accessibility_denied: bool,
 }
 
 struct Shared {
@@ -36,6 +44,7 @@ struct Shared {
     session: Mutex<EdgeSession>,
     status: Mutex<WorkdanceStatus>,
     announced_tray: Mutex<Option<TrayState>>,
+    accessibility_denied: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -53,6 +62,7 @@ impl WorkdanceRuntime {
             camera_open: false,
             tracker_error: None,
             front_camera_mirror_x: mirror_x,
+            accessibility_denied: false,
         };
         let shared = Arc::new(Shared {
             app,
@@ -63,6 +73,7 @@ impl WorkdanceRuntime {
             session: Mutex::new(EdgeSession::default()),
             status: Mutex::new(status),
             announced_tray: Mutex::new(None),
+            accessibility_denied: AtomicBool::new(false),
             join: Mutex::new(None),
         });
         if !enabled {
@@ -81,8 +92,8 @@ impl WorkdanceRuntime {
     pub fn set_enabled(&self, enabled: bool) -> bool {
         self.shared.enabled.store(enabled, Ordering::SeqCst);
         let decisions = self.shared.gate.lock().set_enabled(enabled);
-        apply_decisions(&self.shared, decisions);
-        publish(&self.shared, false);
+        apply_decisions(&self.shared, decisions, &mut None);
+        publish(&self.shared, false, None);
         enabled
     }
 
@@ -129,42 +140,112 @@ impl DictationEdges for HostEdges {
     }
 }
 
-struct HostPointer;
+struct HostPointer<'a> {
+    shared: &'a Shared,
+    last_xy: &'a mut Option<(f32, f32)>,
+}
 
-impl PointerInject for HostPointer {
+impl PointerInject for HostPointer<'_> {
     fn move_to(&mut self, x: i32, y: i32) {
+        if accessibility_blocked(self.shared) {
+            return;
+        }
+        let (sx, sy) = match *self.last_xy {
+            Some((px, py)) => (
+                px + (x as f32 - px) * CURSOR_SMOOTH,
+                py + (y as f32 - py) * CURSOR_SMOOTH,
+            ),
+            None => (x as f32, y as f32),
+        };
+        *self.last_xy = Some((sx, sy));
+        let ix = sx.round() as i32;
+        let iy = sy.round() as i32;
         use enigo::{Coordinate, Enigo, Mouse, Settings};
         match Enigo::new(&Settings::default()) {
             Ok(mut enigo) => {
-                if let Err(err) = enigo.move_mouse(x, y, Coordinate::Abs) {
+                if let Err(err) = enigo.move_mouse(ix, iy, Coordinate::Abs) {
                     log::warn!("[workdance] pointer move: {err}");
+                    mark_inject_failure(self.shared, &err.to_string());
                 }
             }
-            Err(err) => log::warn!("[workdance] pointer backend: {err}"),
+            Err(err) => {
+                log::warn!("[workdance] pointer backend: {err}");
+                mark_inject_failure(self.shared, &err.to_string());
+            }
         }
     }
 
     fn left_click(&mut self) {
+        if accessibility_blocked(self.shared) {
+            return;
+        }
         use enigo::{Button, Direction, Enigo, Mouse, Settings};
         match Enigo::new(&Settings::default()) {
             Ok(mut enigo) => {
                 if let Err(err) = enigo.button(Button::Left, Direction::Click) {
                     log::warn!("[workdance] pointer click: {err}");
+                    mark_inject_failure(self.shared, &err.to_string());
                 }
             }
-            Err(err) => log::warn!("[workdance] pointer backend: {err}"),
+            Err(err) => {
+                log::warn!("[workdance] pointer backend: {err}");
+                mark_inject_failure(self.shared, &err.to_string());
+            }
         }
+    }
+}
+
+fn accessibility_blocked(shared: &Shared) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::permissions::{check_accessibility, PermissionStatus};
+        let status = check_accessibility();
+        let denied = !matches!(
+            status,
+            PermissionStatus::Granted | PermissionStatus::NotApplicable
+        );
+        shared
+            .accessibility_denied
+            .store(denied, Ordering::SeqCst);
+        if denied {
+            publish(shared, shared.status.lock().camera_open, None);
+        }
+        denied
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = shared;
+        false
+    }
+}
+
+fn mark_inject_failure(shared: &Shared, err: &str) {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("access")
+        || lower.contains("permission")
+        || lower.contains("not trusted")
+        || lower.contains("ax")
+    {
+        shared
+            .accessibility_denied
+            .store(true, Ordering::SeqCst);
+        publish(shared, shared.status.lock().camera_open, None);
     }
 }
 
 fn run_loop(shared: Arc<Shared>) {
     let mut vision: Option<Vision> = None;
     let mut announced_error = false;
+    let mut last_cursor: Option<(f32, f32)> = None;
+    let mut smooth_landmarks: Option<[Landmark; HAND_LANDMARKS]> = None;
     let origin = Instant::now();
     while !shared.stop.load(Ordering::SeqCst) {
         let tick = Instant::now();
         if !shared.enabled.load(Ordering::SeqCst) {
             vision = None;
+            smooth_landmarks = None;
+            last_cursor = None;
+            hide_pip(&shared.app);
             let decisions = {
                 let mut gate = shared.gate.lock();
                 if gate.snapshot().gesture_enabled {
@@ -173,8 +254,8 @@ fn run_loop(shared: Arc<Shared>) {
                     Vec::new()
                 }
             };
-            apply_decisions(&shared, decisions);
-            publish(&shared, false);
+            apply_decisions(&shared, decisions, &mut last_cursor);
+            publish(&shared, false, None);
             thread::sleep(Duration::from_millis(200));
             continue;
         }
@@ -185,6 +266,7 @@ fn run_loop(shared: Arc<Shared>) {
                     announced_error = false;
                     shared.status.lock().tracker_error = None;
                     log::info!("[workdance] hand tracker running");
+                    ensure_pip_window(&shared.app);
                 }
                 Err(err) => {
                     if !announced_error {
@@ -192,7 +274,8 @@ fn run_loop(shared: Arc<Shared>) {
                         announced_error = true;
                     }
                     shared.status.lock().tracker_error = Some(err);
-                    publish(&shared, false);
+                    hide_pip(&shared.app);
+                    publish(&shared, false, None);
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -203,18 +286,54 @@ fn run_loop(shared: Arc<Shared>) {
             Ok(frame) => vision.as_mut().unwrap().hands.detect(&frame, t_ms),
             Err(err) => {
                 log::warn!("[workdance] camera frame: {err}");
+                // Persistent capture failure (often permission) → surface as not installed.
+                let lower = err.to_string().to_ascii_lowercase();
+                if lower.contains("permission")
+                    || lower.contains("denied")
+                    || lower.contains("not authorized")
+                    || lower.contains("not trusted")
+                {
+                    shared.status.lock().tracker_error =
+                        Some(format!("camera unavailable: {err}"));
+                }
                 HandObservation::absent(t_ms)
             }
         };
+
+        let smoothed = smooth_observation(&obs, &mut smooth_landmarks);
         let external = dictation_busy(&shared.app);
-        let decisions = shared.gate.lock().push(obs, external);
-        apply_decisions(&shared, decisions);
-        publish(&shared, true);
+        let decisions = shared.gate.lock().push(smoothed.clone(), external);
+        apply_decisions(&shared, decisions, &mut last_cursor);
+        publish(&shared, true, Some(&smoothed));
         let rest = Duration::from_millis(33).saturating_sub(tick.elapsed());
         if !rest.is_zero() {
             thread::sleep(rest);
         }
     }
+}
+
+fn smooth_observation(
+    obs: &HandObservation,
+    prev: &mut Option<[Landmark; HAND_LANDMARKS]>,
+) -> HandObservation {
+    let Some(raw) = obs.landmarks else {
+        *prev = None;
+        return HandObservation::absent(obs.t_ms);
+    };
+    let smoothed = match prev {
+        Some(p) => {
+            let mut out = raw;
+            for i in 0..HAND_LANDMARKS {
+                out[i].x = p[i].x + (raw[i].x - p[i].x) * LANDMARK_SMOOTH;
+                out[i].y = p[i].y + (raw[i].y - p[i].y) * LANDMARK_SMOOTH;
+                out[i].z = p[i].z + (raw[i].z - p[i].z) * LANDMARK_SMOOTH;
+            }
+            out
+        }
+        None => raw,
+    };
+    *prev = Some(smoothed);
+    HandObservation::with_landmarks(obs.t_ms, smoothed, obs.confidence)
 }
 
 fn dictation_busy(app: &AppHandle) -> bool {
@@ -231,14 +350,21 @@ fn dictation_busy(app: &AppHandle) -> bool {
     )
 }
 
-fn apply_decisions(shared: &Shared, decisions: Vec<Decision>) {
+fn apply_decisions(
+    shared: &Shared,
+    decisions: Vec<Decision>,
+    last_cursor: &mut Option<(f32, f32)>,
+) {
     if decisions.is_empty() {
         return;
     }
     let mut edges = HostEdges {
         app: shared.app.clone(),
     };
-    let mut pointer = HostPointer;
+    let mut pointer = HostPointer {
+        shared,
+        last_xy: last_cursor,
+    };
     let screen = current_screen(&shared.app, shared.mirror_x);
     let mut session = shared.session.lock();
     for decision in decisions {
@@ -267,16 +393,22 @@ fn current_screen(app: &AppHandle, mirror_x: bool) -> Screen {
     }
 }
 
-fn publish(shared: &Shared, camera_open: bool) {
+fn publish(shared: &Shared, camera_open: bool, obs: Option<&HandObservation>) {
     let snapshot = shared.gate.lock().snapshot();
     let tracker_error = shared.status.lock().tracker_error.clone();
-    let tray = TrayState::effective(snapshot.gate_state, tracker_error.as_deref());
+    let access_denied = shared.accessibility_denied.load(Ordering::SeqCst);
+    let tray = TrayState::effective(
+        snapshot.gate_state,
+        tracker_error.as_deref(),
+        access_denied,
+    );
     let tooltip = tray.tooltip();
     {
         let mut status = shared.status.lock();
-        status.gate = snapshot;
+        status.gate = snapshot.clone();
         status.camera_open = camera_open && shared.enabled.load(Ordering::SeqCst);
         status.front_camera_mirror_x = shared.mirror_x;
+        status.accessibility_denied = access_denied;
     }
     let changed = {
         let mut announced = shared.announced_tray.lock();
@@ -284,20 +416,114 @@ fn publish(shared: &Shared, camera_open: bool) {
         *announced = Some(tray);
         changed
     };
-    if !changed {
-        return;
+    if changed {
+        if let Some(icon) = shared.app.tray_by_id("main-tray") {
+            let _ = icon.set_tooltip(Some(tooltip.clone()));
+            let _ = icon.set_title(Some(tray.label_zh()));
+        }
+        let _ = shared.app.emit(
+            "workdance:tray",
+            TrayEvent {
+                state: tray,
+                label: tooltip,
+            },
+        );
     }
-    if let Some(icon) = shared.app.tray_by_id("main-tray") {
-        let _ = icon.set_tooltip(Some(tooltip.clone()));
-        let _ = icon.set_title(Some(tray.label_zh()));
-    }
+
+    // Continuity PiP: always emit hand frame for skeleton + count.
+    let (hand_count, landmarks) = match obs.and_then(|o| o.landmarks.as_ref()) {
+        Some(ls) if obs.map(|o| o.confidence).unwrap_or(0.0) >= 0.5 => {
+            let pts: Vec<LandmarkPt> = ls
+                .iter()
+                .map(|l| LandmarkPt {
+                    x: l.x,
+                    y: l.y,
+                    z: l.z,
+                })
+                .collect();
+            (1u32, Some(pts))
+        }
+        _ => (0u32, None),
+    };
     let _ = shared.app.emit(
-        "workdance:tray",
-        TrayEvent {
-            state: tray,
-            label: tooltip,
+        "workdance:hand",
+        HandEvent {
+            hand_count,
+            gate_state: tray,
+            landmarks,
+            accessibility_denied: access_denied,
+            label_zh: tray.label_zh().to_string(),
         },
     );
+    sync_pip_visibility(&shared.app, camera_open && shared.enabled.load(Ordering::SeqCst), tray);
+}
+
+fn ensure_pip_window(app: &AppHandle) {
+    if app.get_webview_window(PIP_LABEL).is_some() {
+        return;
+    }
+    let built = WebviewWindowBuilder::new(
+        app,
+        PIP_LABEL,
+        WebviewUrl::App("index.html?window=workdance-pip".into()),
+    )
+    .title("WorkDance Hand")
+    .inner_size(PIP_W, PIP_H)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .focused(false)
+    .build();
+    match built {
+        Ok(w) => {
+            position_pip_bottom_right(app, &w);
+            let _ = w.show();
+        }
+        Err(err) => log::warn!("[workdance] pip window create failed: {err}"),
+    }
+}
+
+fn position_pip_bottom_right(app: &AppHandle, w: &tauri::WebviewWindow) {
+    if let Ok(Some(m)) = app.primary_monitor() {
+        let size = m.size();
+        let scale = m.scale_factor();
+        let w_px = (PIP_W * scale) as i32;
+        let h_px = (PIP_H * scale) as i32;
+        let margin = (28.0 * scale) as i32;
+        let x = size.width as i32 - w_px - margin;
+        let y = size.height as i32 - h_px - margin - (40.0 * scale) as i32;
+        let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
+    }
+}
+
+fn sync_pip_visibility(app: &AppHandle, camera_open: bool, tray: TrayState) {
+    let Some(w) = app.get_webview_window(PIP_LABEL) else {
+        if camera_open {
+            ensure_pip_window(app);
+        }
+        return;
+    };
+    match tray {
+        TrayState::NotInstalled => {
+            let _ = w.hide();
+        }
+        _ if camera_open => {
+            position_pip_bottom_right(app, &w);
+            let _ = w.show();
+        }
+        _ => {
+            let _ = w.hide();
+        }
+    }
+}
+
+fn hide_pip(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(PIP_LABEL) {
+        let _ = w.hide();
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -305,4 +531,22 @@ fn publish(shared: &Shared, camera_open: bool) {
 struct TrayEvent {
     state: TrayState,
     label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LandmarkPt {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HandEvent {
+    hand_count: u32,
+    gate_state: TrayState,
+    landmarks: Option<Vec<LandmarkPt>>,
+    accessibility_denied: bool,
+    label_zh: String,
 }

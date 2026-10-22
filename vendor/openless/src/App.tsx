@@ -65,6 +65,7 @@ interface AppProps {
   isVoiceEdit: boolean;
   isLessComputer: boolean;
   isLessComputerGlow: boolean;
+  isWorkdancePip: boolean;
   forcedOs?: OS | null;
 }
 
@@ -97,11 +98,11 @@ export function App(props: AppProps) {
 
   if (error) {
     return (
-      <CoreStartupScreen error={error} compact={props.isCapsule || props.isLessComputerGlow} />
+      <CoreStartupScreen error={error} compact={props.isCapsule || props.isLessComputerGlow || props.isWorkdancePip} />
     );
   }
   if (!ready) {
-    return <CoreStartupScreen compact={props.isCapsule || props.isLessComputerGlow} />;
+    return <CoreStartupScreen compact={props.isCapsule || props.isLessComputerGlow || props.isWorkdancePip} />;
   }
   return <ReadyApp {...props} />;
 }
@@ -114,6 +115,7 @@ function ReadyApp({
   isVoiceEdit,
   isLessComputer,
   isLessComputerGlow,
+  isWorkdancePip,
   forcedOs,
 }: AppProps) {
   if (isCapsuleRail) {
@@ -156,6 +158,13 @@ function ReadyApp({
         <LessComputerGlow />
       </Suspense>
     ) : null;
+  }
+  if (isWorkdancePip) {
+    return (
+      <Suspense fallback={null}>
+        <WorkdancePip />
+      </Suspense>
+    );
   }
 
   const os = forcedOs ?? detectOS();
