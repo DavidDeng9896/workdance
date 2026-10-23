@@ -439,8 +439,13 @@ fn observation_from_result(result: &MpHandLandmarkerResult, t_ms: u64) -> HandOb
     let Some(landmarks) = extract_landmarks(result) else {
         return HandObservation::absent(t_ms);
     };
-    let confidence = handedness_score(result).unwrap_or(0.9);
-    HandObservation::with_landmarks(t_ms, landmarks, confidence.clamp(0.0, 1.0))
+    // Handedness score can read near-zero on some ABIs / empty category lists;
+    // landmarks already prove a hand — don't starve the gate/PiP on a bad score.
+    let confidence = match handedness_score(result) {
+        Some(s) if s >= 0.25 => s.clamp(0.0, 1.0),
+        _ => 0.9,
+    };
+    HandObservation::with_landmarks(t_ms, landmarks, confidence)
 }
 
 fn handedness_score(result: &MpHandLandmarkerResult) -> Option<f32> {

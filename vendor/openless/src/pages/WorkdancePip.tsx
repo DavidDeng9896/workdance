@@ -9,6 +9,8 @@ type HandPayload = {
   landmarks: Landmark[] | null;
   accessibilityDenied?: boolean;
   labelZh?: string;
+  /** Base64 BMP from the Rust-owned camera (same frames as MediaPipe). */
+  frameJpeg?: string | null;
 };
 
 const HAND_EDGES: Array<[number, number]> = [
@@ -40,44 +42,17 @@ function trayLabel(state: string): string {
 }
 
 export function WorkdancePip() {
-  const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const previewRef = useRef<HTMLImageElement>(null);
   const smoothRef = useRef<Array<{ x: number; y: number }> | null>(null);
   const [count, setCount] = useState(0);
   const [status, setStatus] = useState('');
   const [perm, setPerm] = useState(false);
 
   useEffect(() => {
-    let stream: MediaStream | null = null;
-    let cancelled = false;
-    (async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: false,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        const video = videoRef.current;
-        if (video) {
-          video.srcObject = stream;
-          await video.play().catch(() => {});
-        }
-      } catch (err) {
-        console.warn('[workdance-pip] camera', err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      stream?.getTracks().forEach((t) => t.stop());
-    };
-  }, []);
-
-  useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    let objectUrl: string | null = null;
     (async () => {
       unlisten = await listen<HandPayload>('workdance:hand', (ev) => {
         if (cancelled) return;
@@ -89,6 +64,20 @@ export function WorkdancePip() {
         const access =
           state === 'needs_accessibility' || payload?.accessibilityDenied === true;
         setPerm(access);
+
+        const jpeg = payload?.frameJpeg;
+        if (jpeg && previewRef.current) {
+          const next = `data:image/bmp;base64,${jpeg}`;
+          // Assign via src; browser caches identical data URLs cheaply enough at ~30fps.
+          if (previewRef.current.src !== next) {
+            previewRef.current.src = next;
+          }
+          if (objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+            objectUrl = null;
+          }
+        }
+
         const canvas = canvasRef.current;
         const ctx = canvas?.getContext('2d');
         if (!canvas || !ctx) return;
@@ -97,7 +86,7 @@ export function WorkdancePip() {
           smoothRef.current = null;
           return;
         }
-        // Video CSS-mirrored; mirror landmarks to match.
+        // Preview CSS-mirrored; mirror landmarks to match.
         const pts = payload.landmarks.map((p) => ({
           x: (1 - p.x) * canvas.width,
           y: p.y * canvas.height,
@@ -144,6 +133,7 @@ export function WorkdancePip() {
     return () => {
       cancelled = true;
       unlisten?.();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, []);
 
@@ -170,11 +160,9 @@ export function WorkdancePip() {
           boxShadow: '0 8px 28px rgba(0,0,0,0.45)',
         }}
       >
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          autoPlay
+        <img
+          ref={previewRef}
+          alt=""
           style={{
             position: 'absolute',
             inset: 0,
@@ -182,6 +170,7 @@ export function WorkdancePip() {
             height: '100%',
             objectFit: 'cover',
             transform: 'scaleX(-1)',
+            background: '#0a0a0c',
           }}
         />
         <canvas
